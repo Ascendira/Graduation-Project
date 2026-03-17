@@ -1,6 +1,14 @@
 #ifndef Constant_h
 #define Constant_h
 
+#include <sundials/sundials_types.h>
+
+// 兼容 SUNDIALS 7.0+ 版本的类型与宏变更
+#ifndef RCONST
+#define RCONST SUN_RCONST
+typedef sunrealtype realtype;
+#endif
+
 #define ZERO RCONST(0.0) // zero
 #define ONE RCONST(1.0)  // one
 #define TWO RCONST(2.0)  // two
@@ -10,6 +18,7 @@
 
 #define numPhase 2 // Number of precipitating phases
 #define numComp 3  // Number of precipitating components
+// #define numComp 4 // Number of precipitating components
 #define numClass                                                               \
   50000         // Number of cluster classes/maximum cluster size considered
 #define runs 70 // Number of loops to run
