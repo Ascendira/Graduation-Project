@@ -24,16 +24,13 @@ void LoadInput(InputCondition *ICond, InputMaterial *IMaterial, InputProperty *I
         IMaterial->C0[0] = 0.0116;                      // Mn composition in alloy
         IMaterial->C0[1] = 0.0163;                      // Ni composition in alloy
         IMaterial->C0[2] = 0.0035;                      // Si composition in alloy
-        // IMaterial->C0[3] = 0.0010;                      //Cu (TODO: 填入实际浓度)
         IMaterial->D[0] = (1.49E-4) * exp(-234000.0 / (8.314 * ICond->Temp)); // Mn thermal diffusion coefficient, m2/s
         IMaterial->D[1] = (1.4E-4) * exp(-245765.0 / (8.314 * ICond->Temp));  // Ni thermal diffusion coefficient, m2/s
         IMaterial->D[2] = (0.78E-4) * exp(-231521.6 / (8.314 * ICond->Temp)); // Si thermal diffusion coefficient, m2/s
-        // IMaterial->D[3] = (1.0E-4)*exp(-240000.0/(8.314*ICond->Temp)); // Cu (TODO: 填入准确的 D0 和 Q 值)
         IMaterial->DFe = (2.75E-3) * exp(-(253968.8) / (8.314 * ICond->Temp)); // Fe thermal diffusion coefficient, m2/s
         IMaterial->X[0][0] = 6. / 29.;                                         // Mn composition in T3/G (Mn6Ni16Si7) phase
         IMaterial->X[0][1] = 16. / 29.;                                        // Ni composition in T3/G (Mn6Ni16Si7) phase
         IMaterial->X[0][2] = 7. / 29.;                                         // Si composition in T3/G (Mn6Ni16Si7) phase
-        // IMaterial->X[0][3] = 0.0;                       // T3 相中的 Cu (TODO: 若 Cu 进入 T3 相，需更新此比例)
         IMaterial->X[1][0] = 1. / 3.;                 // Mn composition in T6/Gamma2 (Mn(Ni,Si)2) phase
         IMaterial->X[1][1] = 0.5215;                  // Ni composition in T6/Gamma2 (Mn(Ni,Si)2) phase
         IMaterial->X[1][2] = 0.1452;                  // Si composition in T6/Gamma2 (Mn(Ni,Si)2) phase

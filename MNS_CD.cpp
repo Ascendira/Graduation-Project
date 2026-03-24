@@ -7,12 +7,10 @@
 #include <stdlib.h>
 #include <vector>
 #include <time.h>
-// #include <cvode/cvode_band.h>        /* band solver header */
 #include <nvector/nvector_serial.h>  /* serial N_Vector types, fct. and macros */
 #include <sundials/sundials_math.h>  /* contains the macros ABS, SQR, and EXP */
 #include <sundials/sundials_types.h> /* definition of realtype */
 
-// 现代 SUNDIALS 使用线性代数模块替代了旧的 cvode_band.h
 #include <sunlinsol/sunlinsol_band.h> /* 线性解法器定义 */
 #include <sunmatrix/sunmatrix_band.h> /* 矩阵定义 */
 
@@ -25,6 +23,7 @@
 InputCondition *ICond;    /*Defined in Input.h, including irradiation conditions*/
 InputMaterial *IMaterial; /*Defined in Input.h, including material information*/
 InputProperty *IProp;     /*Defined in Input.h, including all other parameters used in model*/
+GroupMap GMap[numGroups];
 
 using namespace std;
 
@@ -32,62 +31,63 @@ using namespace std;
 
 struct UserDataType
 {
-  realtype *size;
-  realtype **radClust;
-  realtype **beta;
-  realtype **delG;
-  realtype *J;
+    // 基础物理参数 (对应每个组的中心或边界)
+    realtype *n_center;   // 每个组的中心原子数
+    realtype **radGroup;  // 每个相、每个组对应的平均半径
+    realtype **beta;      // 每个相、每个组的吸收系数部分
+    
+    // 通量缓存 (用于 getGroupFlux 和 f 函数之间的计算传递)
+    realtype *J_M0;       // 0阶矩通量缓存 (大小: numCalcPhase * numGroups)
+    realtype *J_M1;       // 1阶矩通量缓存 (大小: numCalcPhase * numGroups)
 
-  // 构造函数：安全地分块动态分配内存
-  UserDataType()
-  {
-    size = new realtype[numClass]();
-    radClust = new realtype *[numPhase];
-    beta = new realtype *[numPhase];
-    delG = new realtype *[numPhase];
-
-    for (int p = 0; p < numPhase; p++)
+    // 构造函数：根据 numGroups 动态分配内存
+    UserDataType()
     {
-      radClust[p] = new realtype[numClass]();
-      beta[p] = new realtype[numClass]();
-      delG[p] = new realtype[numClass]();
-    }
-    J = new realtype[numCalcPhase * (numClass + 1)]();
-  }
+        // 1. 分配组相关的基础数组
+        n_center = new realtype[numGroups]();
+        
+        // 2. 分配多相矩阵 (用于存储各相特有的组属性)
+        radGroup = new realtype *[numPhase];
+        beta     = new realtype *[numPhase];
 
-  // 析构函数：防止内存泄漏
-  ~UserDataType()
-  {
-    delete[] size;
-    for (int p = 0; p < numPhase; p++)
-    {
-      delete[] radClust[p];
-      delete[] beta[p];
-      delete[] delG[p];
+        for (int p = 0; p < numPhase; p++)
+        {
+            radGroup[p] = new realtype[numGroups]();
+            beta[p]     = new realtype[numGroups]();
+        }
+
+        // 3. 分配通量缓存
+        // 必须覆盖所有计算相 (Homo + Heter)
+        J_M0 = new realtype[numCalcPhase * numGroups]();
+        J_M1 = new realtype[numCalcPhase * numGroups]();
     }
-    delete[] radClust;
-    delete[] beta;
-    delete[] delG;
-    delete[] J;
-  }
+
+    // 析构函数：严格释放内存，防止长时间运行下的内存泄漏
+    ~UserDataType()
+    {
+        delete[] n_center;
+
+        for (int p = 0; p < numPhase; p++)
+        {
+            delete[] radGroup[p];
+            delete[] beta[p];
+        }
+        
+        delete[] radGroup;
+        delete[] beta;
+
+        delete[] J_M0;
+        delete[] J_M1;
+    }
 };
 
-// 替换这 5 行声明
-static void loadData(UserDataType *data);
-static void getbeta(realtype *size, realtype **beta);
-static void getSize(realtype *size);
-static void getRadClust(realtype *size, realtype **radClust);
-static void getDelG(realtype *size, realtype **radClust, realtype **delG);
-static void getInitVals(realtype y0[neq]);
+
 static void initParams();
 static void GetRED(realtype D[numComp], realtype Flux);
-static void printYVector(N_Vector y);
-static void getOutput(N_Vector y, realtype radM1[numCalcPhase],
-                      realtype radM2[numCalcPhase],
-                      realtype rhoC[numCalcPhase]);
-static void getFlux(UserDataType *data, N_Vector y, realtype J[]);
+static void getOutput(N_Vector y, realtype radM1[numCalcPhase], realtype radM2[numCalcPhase], realtype rhoC[numCalcPhase]);
+static void printYVector(N_Vector y, int runIdx);
 static int f(realtype t, N_Vector y, N_Vector ydot, void *user_data);
-void int_to_string(int i, string &a, int base);
+static void initGrouping();
 
 /*global problem parameters*/
 realtype D[numComp], aP[numPhase], nu[numPhase][numComp];
@@ -99,114 +99,215 @@ realtype rhoC[numCalcPhase], radM1[numCalcPhase], radM2[numCalcPhase];
 realtype Flux, solProd[numPhase];
 /*Irradiation flux, solute product */
 
-int main()
-{
-  std::vector<realtype> y0data_vec(neq, ZERO); // heap allocation for initial conditions, size neq, initialized to ZERO
-  realtype *y0data = y0data_vec.data();        // pointer to the data of the vector, can be used as C-style array
+int main() {
+    // 1. 初始化 SUNDIALS 上下文与物理参数
+    SUNContext sunctx;
+    SUNContext_Create(SUN_COMM_NULL, &sunctx); //
 
-  realtype t;          // current integral time, will be updated by CVode
-  realtype tout = 1E0; // This is the solution time of each run.  The solver will solve for y0(t) on the range (0,tout)
-  double ts = 0.0;     // This is the start time for each run, tf+tout will be the final time ater each run
+    // 分配输入参数内存
+    ICond = new InputCondition();
+    IMaterial = new InputMaterial();
+    IProp = new InputProperty();
 
-  N_Vector y0 = NULL;
-  UserDataType *data = nullptr;
-  void *cvode_mem = NULL;
-  int flag, mxsteps = 2000000;
-  long int mu = 3, ml = 3;
-  realtype *yd;
+    LoadInput(ICond, IMaterial, IProp); // 加载材料常数
+    initGrouping(); // 关键：必须先初始化分组地图，确定 numGroups
+    initParams();   // 计算扩散系数 D
 
-  SUNContext sunctx;
-  SUNContext_Create(SUN_COMM_NULL, &sunctx);
-  ICond = new InputCondition();
-  IMaterial = new InputMaterial();
-  IProp = new InputProperty();
+    // 2. 定义并初始化 N_Vector y (求解器的核心向量)
+    // 这里的长度是 neq_groups = (4 * numGroups * 2) + 3
+    N_Vector y = N_VNew_Serial(neq_groups, sunctx); 
+    realtype *yd = NV_DATA_S(y);
 
-  LoadInput(ICond, IMaterial, IProp);
-  initParams();
-  getInitVals(y0data);
-  y0 = N_VMake_Serial(neq, y0data, sunctx);
+    // 初始值填充：所有矩变量设为极小值，溶质设为初始浓度
+    for (int i = 0; i < neq_groups; i++) yd[i] = 1.0E-30;
 
-  /*Write the output file*/
-  ofstream O_file;
-  O_file.open("Output");
-  cout << "Output file absolute path: " << std::filesystem::absolute("Output") << endl;
-  O_file << "Run\tCalcTime(s)\tTime(s)\tFluence(n/m2s)\t";
-  for (int p = 0; p < numPhase; p++)
-  {
-    string phaseStr;
-    int_to_string(p + 1, phaseStr, 10);
-    cout << p << " " << p + 1 << " " << phaseStr << endl;
-    O_file << "Mean_Radius_of_Phase_" + phaseStr +
-                  "_Homo(m)\tNumber_Density_of_Phase_" + phaseStr +
-                  "_Homo(1/m3)\t";
-  }
-  for (int p = 0; p < numPhase; p++)
-  {
-    string phaseStr;
-    int_to_string(p + 1, phaseStr, 10);
-    O_file << "Mean_Radius_of_Phase_" + phaseStr +
-                  "_Heter(m)\tNumber_Density_of_Phase_" + phaseStr +
-                  "_Heter(1/m3)\t";
-  }
-  O_file << "Mn\tNi\tSi" << endl;
-
-  /*Solving all the equations*/
-  for (int i = 0; i < runs; i++)
-  {
-    cvode_mem = CVodeCreate(CV_BDF, sunctx);
-
-    data = new UserDataType();
-    loadData(data);
-
-    flag = CVodeSetUserData(cvode_mem, data);
-    flag = CVodeInit(cvode_mem, f, T0, y0);
-    flag = CVodeSStolerances(cvode_mem, RTOL, ATOL);
-
-    SUNMatrix A = SUNBandMatrix(neq, mu, ml, sunctx);
-    SUNLinearSolver LS = SUNLinSol_Band(y0, A, sunctx);
-    flag = CVodeSetLinearSolver(cvode_mem, LS, A);
-    flag = CVodeSetMaxNumSteps(cvode_mem, mxsteps);
-
-    time_t tik, tok;
-    time(&tik);
-    flag = CVode(cvode_mem, tout, y0, &t, CV_NORMAL);
-    time(&tok);
-
-    getOutput(y0, radM1, radM2, rhoC);
-    yd = NV_DATA_S(y0);
-
-    if (O_file.is_open())
-    {
-      O_file << i << "\t" << difftime(tok, tik) << "\t" << ts + tout
-             << "\t" << (ts + tout) * Flux << "\t";
+    // 设置矩阵溶质初始浓度 (位于向量末尾)
+    for (int c = 0; c < numComp; c++) {
+        yd[neq_groups - numComp + c] = IMaterial->C0[c];
     }
-    for (int p = 0; p < numCalcPhase; p++)
-    {
-      O_file << RadiusCalc[p] << "\t" << rhoC[p] << "\t";
+
+    // 设置单体 (n=1) 的初始矩：将有效单体浓度放入各相的第0个组
+    for (int p = 0; p < numPhase; p++) {
+        realtype solProd_init = 1.0;
+        for (int c = 0; c < numComp; c++) 
+            solProd_init *= pow(IMaterial->C0[c], IMaterial->X[p][c]);
+        
+        int p_base = p * numGroups * 2;
+        yd[p_base] = solProd_init;               // M0_g0 (数量)
+        yd[p_base + numGroups] = solProd_init * 1.0; // M1_g0 (质量，因为 n=1)
     }
-    O_file << yd[neq - 3] << "\t" << yd[neq - 2] << "\t" << yd[neq - 1] << endl;
 
-    printYVector(y0);
+    // 3. 配置 CVODE 求解器
+    void *cvode_mem = CVodeCreate(CV_BDF, sunctx); //
+    UserDataType *data = new UserDataType();      // 包含通量缓存的自定义结构
+    for(int g=0; g<numGroups; g++) data->n_center[g] = GMap[g].n_center;
 
+    CVodeSetUserData(cvode_mem, data);
+    CVodeInit(cvode_mem, f, T0, y); // 关联导数函数 f
+    CVodeSStolerances(cvode_mem, RTOL, ATOL); //
+
+    // 线性解法器配置 (使用带状矩阵优化性能)
+    SUNMatrix A = SUNBandMatrix(neq_groups, numGroups*2, numGroups*2, sunctx); 
+    SUNLinearSolver LS = SUNLinSol_Band(y, A, sunctx);
+    CVodeSetLinearSolver(cvode_mem, LS, A);
+
+    // 4. 计算循环与输出
+    realtype t, tout = 1.0; 
+    ofstream O_file("Output_Grouping.txt");
+    O_file << "Time(s)\tMn\tNi\tSi\tRad_Phase1\tRho_Phase1..." << endl;
+
+    for (int i = 0; i < runs; i++) {
+        int flag = CVode(cvode_mem, tout, y, &t, CV_NORMAL);
+        if (flag < 0) break;
+
+        // --- 调用统计函数 ---
+        getOutput(y, radM1, radM2, rhoC); // 计算 R 和 rho
+        printYVector(y, i);              // 打印尺寸分布快照
+
+        // 写入主输出
+        O_file << t << "\t" << yd[neq_groups-3] << "\t" << yd[neq_groups-2] << "\t" << yd[neq_groups-1];
+        for (int p = 0; p < numCalcPhase; p++) {
+            O_file << "\t" << radM2[p] << "\t" << rhoC[p];
+        }
+        O_file << endl;
+
+        tout *= 1.5; // 对数步长推进
+    }
+
+    // 5. 释放资源
+    N_VDestroy(y);
+    delete data;
+    CVodeFree(&cvode_mem);
     SUNLinSolFree(LS);
     SUNMatDestroy(A);
-    CVodeFree(&cvode_mem);
+    SUNContext_Free(&sunctx);
+    return 0;
+}
+/**
+ * 初始化集群分组地图
+ * 将 1 到 50000+ 的集群映射到有限数量的组 (numGroups) 中
+ */
+static void initGrouping() {
+    realtype current_n = 1.0;
+    realtype current_width = 1.0;
 
-    delete data;
+    for (int g = 0; g < numGroups; g++) {
+        GMap[g].n_min = current_n;
 
-    ts = ts + tout;
-    tout = pow(10, i / 9);
-  }
+        if (g < numDiscrete) {
+            // 离散阶段：每组宽度为 1
+            GMap[g].width = 1.0;
+        } else {
+            // 分组阶段：宽度按几何级数增长 (类似 Xolotl 的空间分布逻辑)
+            // 确保宽度至少为 1 且为整数
+            current_width *= groupingFactor;
+            GMap[g].width = std::max(1.0, std::round(current_width));
+        }
 
-  N_VDestroy_Serial(y0);
-  SUNContext_Free(&sunctx);
+        GMap[g].n_max = GMap[g].n_min + GMap[g].width - 1.0;
+        GMap[g].n_center = (GMap[g].n_min + GMap[g].n_max) / 2.0;
 
-  // 清理全局指针
-  delete ICond;
-  delete IMaterial;
-  delete IProp;
+        // 为下一组准备起始位置
+        current_n = GMap[g].n_max + 1.0;
+    }
+    
+    // 自动更新最大集群尺寸
+    printf("Grouping complete. Max cluster size considered: %.0f atoms\n", GMap[numGroups-1].n_max);
+}
 
-  return 0;
+/**
+ * 差值法：计算组内平均原子数 n_avg
+ * $n_{avg} = \frac{M_1}{M_0}$
+ */
+static realtype getAvgN(realtype M0, realtype M1, int groupIdx) {
+    if (M0 < 1e-40) return GMap[groupIdx].n_center;
+    
+    realtype n_avg = M1 / M0;
+    
+    // 边界检查：确保平均值不超出组的物理范围
+    if (n_avg < GMap[groupIdx].n_min) return GMap[groupIdx].n_min;
+    if (n_avg > GMap[groupIdx].n_max) return GMap[groupIdx].n_max;
+    
+    return n_avg;
+}
+
+/**
+ * 查找特定尺寸 n 属于哪个组
+ * 用于将初始浓度分布映射到组上
+ */
+static int findGroupIndex(realtype n) {
+    if (n < 1) return 0;
+    for (int g = 0; g < numGroups; g++) {
+        if (n >= GMap[g].n_min && n <= GMap[g].n_max) {
+            return g;
+        }
+    }
+    return numGroups - 1;
+}
+
+/**
+ * 基于 GroupMap 和矩重构计算组间通量
+ * y 向量布局: [Phase0_M0(numGroups), Phase0_M1(numGroups), Phase1_M0... , Solutes(numComp)]
+ */
+static void getGroupFlux(UserDataType *data, N_Vector y, realtype *J_M0, realtype *J_M1) {
+    realtype *yd = NV_DATA_S(y);
+    int M1_offset = numGroups; // M1 变量相对于 M0 的偏移
+    
+    // 获取当前的矩阵溶质浓度 (最后 numComp 个元素)
+    realtype solP[numCalcPhase];
+    for (int p = 0; p < numCalcPhase; p++) {
+        int pref = p % numPhase;
+        solP[p] = 1.0;
+        for (int c = 0; c < numComp; c++) {
+            // 从 y 向量末尾提取溶质浓度
+            realtype C_solute = yd[neq - numComp + c];
+            solP[p] *= pow(C_solute, IMaterial->X[pref][c]);
+        }
+    }
+
+    for (int p = 0; p < numCalcPhase; p++) {
+        int pref = p % numPhase;
+        int p_base = p * numGroups * 2;
+
+        // 遍历所有组，计算 g -> g+1 的通量
+        for (int g = 0; g < numGroups - 1; g++) {
+            realtype M0_g = yd[p_base + g];
+            realtype M1_g = yd[p_base + g + M1_offset];
+            
+            // 1. 计算组内平均尺寸和物理属性
+            realtype n_avg = getAvgN(M0_g, M1_g, g);
+            realtype r_avg = pow(3.0 * IMaterial->cVol[pref] * n_avg / (4.0 * pi), 1.0/3.0);
+            
+            // 吸收速率 beta (与半径成正比)
+            realtype beta_g = (4.0 * pi * aP[pref] * r_avg * D[0]) / IMaterial->aVol; 
+
+            // 2. 矩重构：计算组边界 n_max 处的有效浓度 C_boundary
+            // 如果 M0 很小，浓度趋于 0
+            realtype C_boundary = 0.0;
+            if (M0_g > 1e-35) {
+                // 计算偏离度：平均尺寸相对于中心点的偏移
+                realtype delta_n = n_avg - GMap[g].n_center;
+                // 计算斜率因子 (简化的线性近似)
+                realtype slope = (GMap[g].width > 1) ? (12.0 * delta_n / (GMap[g].width * GMap[g].width)) : 0;
+                // 边界处的浓度 = 平均浓度 * (1 + 相对斜率补正)
+                C_boundary = (M0_g / GMap[g].width) * (1.0 + slope * (GMap[g].n_max - GMap[g].n_center));
+            }
+
+            // 3. 计算跨组净通量 J = 吸收 - 发射
+            // 这里假设跨组是通过单原子吸附/脱附实现的
+            realtype flux = beta_g * (solP[p] * C_boundary - 
+                            (IMaterial->solPBar[pref] / solP[p]) * C_boundary); 
+
+            // 4. 记录 0 阶和 1 阶通量 [cite: 101, 105, 106]
+            J_M0[p * numGroups + g] = flux;
+            // 1 阶通量代表原子总数的转移，需乘以边界处的原子数
+            J_M1[p * numGroups + g] = GMap[g].n_max * flux; 
+        }
+        
+        // 边界处理：最后一组通量设为 0
+        J_M0[p * numGroups + numGroups - 1] = 0.0;
+        J_M1[p * numGroups + numGroups - 1] = 0.0;
+    }
 }
 
 /*************************************************
@@ -275,263 +376,81 @@ static void GetRED(realtype D[numComp], realtype Flux)
   }
 }
 
-/*****************************************************************
+/**
+ * 导数函数 f: 计算 dM0/dt, dM1/dt 和 dC_matrix/dt
+ */
+static int f(realtype t, N_Vector y, N_Vector ydot, void *user_data) {
+    realtype *yd = NV_DATA_S(y);
+    realtype *ydotd = NV_DATA_S(ydot);
+    UserDataType *data = static_cast<UserDataType *>(user_data);
 
-This function loads data that is as a function of cluster size
-All values are calcuate via next few functions.
+    // 1. 初始化导数向量
+    for (int i = 0; i < neq; i++) ydotd[i] = 0.0;
 
-*****************************************************************/
-static void loadData(UserDataType *data)
-{
-  getSize(data->size);
-  getRadClust(data->size, data->radClust);
-  getbeta(data->size, data->beta);
-  getDelG(data->size, data->radClust, data->delG);
-  return;
-}
+    // 2. 调用重写的 getGroupFlux 获取跨组通量
+    // J_M0[p * numGroups + g] 是从组 g 到 g+1 的数量通量
+    // J_M1[p * numGroups + g] 是从组 g 到 g+1 的原子质量通量
+    getGroupFlux(data, y, data->J_M0, data->J_M1);
 
-/*****************************************************************
+    // 用于计算溶质消耗的累加器 [Mn, Ni, Si]
+    realtype total_solute_consumption[numComp] = {0.0, 0.0, 0.0};
 
-This function calculates part of the absorption rate
+    // 3. 遍历每个相 (Homo/Heter) 和每个组
+    for (int p = 0; p < numCalcPhase; p++) {
+        int pref = p % numPhase;
+        int p_base = p * numGroups * 2;
+        int M0_base = p_base;
+        int M1_base = p_base + numGroups;
 
-*****************************************************************/
-static void getbeta(realtype *size, realtype **beta)
-{
-  for (int p = 0; p < numPhase; p++)
-  {
-    for (int i = 0; i < numClass; i++)
-    {
-      beta[p][i] = (4 * pi * aP[p] * pow(size[i], (1. / 3.))) / IMaterial->aVol;
+        for (int g = 0; g < numGroups; g++) {
+            // 获取流入和流出的通量 (组 g 的输入来自 g-1)
+            realtype J0_in  = (g == 0) ? 0.0 : data->J_M0[p * numGroups + g - 1];
+            realtype J0_out = data->J_M0[p * numGroups + g];
+
+            realtype J1_in  = (g == 0) ? 0.0 : data->J_M1[p * numGroups + g - 1];
+            realtype J1_out = data->J_M1[p * numGroups + g];
+
+            // --- 0阶矩方程: dM0/dt = J_in - J_out ---
+            ydotd[M0_base + g] = J0_in - J0_out;
+
+            // --- 1阶矩方程: dM1/dt = n_in*J_in - n_out*J_out ---
+            ydotd[M1_base + g] = J1_in - J1_out;
+
+            // --- 质量守恒累加 ---
+            // 溶质原子从矩阵转移到沉淀中，消耗率 = \sum (X_p,c * dM1_p,g/dt)
+            for (int c = 0; c < numComp; c++) {
+                total_solute_consumption[c] += IMaterial->X[pref][c] * ydotd[M1_base + g];
+            }
+        }
     }
-  }
-  return;
-}
 
-/*****************************************************************
-
-This function calculates number of atoms (size) in each cluster
-
-*****************************************************************/
-
-static void getSize(realtype *size)
-{
-  for (int i = 0; i < numClass; i++)
-  {
-    size[i] = double(i + 1);
-  }
-  return;
-}
-
-/*****************************************************************
-
-This function calculates radius of each cluster
-
-*****************************************************************/
-
-static void getRadClust(realtype *size, realtype **radClust)
-{
-  for (int p = 0; p < numPhase; p++)
-  {
-    for (int i = 0; i < numClass; i++)
-    {
-      radClust[p][i] = pow(3 * IMaterial->cVol[p] * size[i] / (4 * pi), 1. / 3.);
+    // 4. 处理级联损伤产生 (Cascade Damage / Heterogeneous Nucleation)
+    // 根据原代码逻辑计算 GR
+    realtype solP_pref = 1.0; 
+    for (int c = 0; c < numComp; c++) {
+        solP_pref *= pow(yd[neq - numComp + c], IMaterial->X[IProp->HGPhase][c]);
     }
-  }
-  return;
-}
+    realtype GR = IProp->Alpha * Flux * IProp->ccs * solP_pref / IProp->RsolP; // Eq. 5
 
-/*********************************************************************************
+    // 找到级联产生尺寸 HGSize 属于哪个组
+    int g_hg = findGroupIndex(IProp->HGSize);
+    int p_hg = IProp->HGPhase + numPhase; // 异质相索引布局
+    
+    // 更新该组的矩变量
+    ydotd[p_hg * numGroups * 2 + g_hg] += GR;              // M0 增加
+    ydotd[p_hg * numGroups * 2 + numGroups + g_hg] += IProp->HGSize * GR; // M1 增加 (原子总数)
 
-This function calculates difference of interfacial energy between adjacent
-clusters
-
-**********************************************************************************/
-
-static void getDelG(realtype *size, realtype **radClust, realtype **delG)
-{
-  realtype delta;
-  for (int p = 0; p < numPhase; p++)
-  {
-    for (int i = 1; i < numClass; i++)
-    {
-      delta = (IMaterial->sig[p] * 4 * pi * pow(radClust[p][i], TWO)) - 
-              (IMaterial->sig[p] * 4 * pi * pow(radClust[p][i - 1], TWO));
-      delG[p][i] = exp(delta / (kb * ICond->Temp));
+    // 补充级联引起的溶质消耗
+    for (int c = 0; c < numComp; c++) {
+        total_solute_consumption[c] += IMaterial->X[IProp->HGPhase][c] * (IProp->HGSize * GR);
     }
-  }
-  return;
-}
 
-/*****************************************************************
-
-This function gives the inital values of number density of each cluster
-1E-30 for clusters >= 2 atoms
-monomer concentration is calculated based on Eq. SI-15
-
-*****************************************************************/
-
-static void getInitVals(realtype y0[neq])
-{
-  realtype base = 1E-30;
-  int neqToNcom = neq - numComp;
-  for (int i = 0; i < neqToNcom; i++)
-  {
-    y0[i] = base;
-  }
-  for (int c = 0; c < numComp; c++)
-  {
-    y0[neqToNcom + c] = IMaterial->C0[c]; 
-    /*Concentration of solute in matrix*/
-  }
-  for (int p = 0; p < numPhase; p++)
-  {
-    solProd[p] = 1;
-    for (int c = 0; c < numComp; c++)
-    {
-      solProd[p] = solProd[p] * pow(IMaterial->C0[c], IMaterial->X[p][c]);
+    // 5. 更新矩阵溶质浓度: dC/dt = - 沉淀消耗
+    for (int c = 0; c < numComp; c++) {
+        ydotd[neq - numComp + c] = -total_solute_consumption[c];
     }
-    y0[p * numClass] = solProd[p]; 
-    /*Effective monomer concentration, based on Eq. SI-15*/
-    /*The monomer concentration of n=1 set only in the homogeneous phase of T3 and T6 conforms to thermodynamic evolution*/
-  }
-  return;
-}
 
-/**************************************************************************
-
-This function calculates flux (Jn->n+1) between adjacent clusters, Eq. SI-2
-
-****************************************************************************/
-
-static int fluxIndex(int phase, int cluster)
-{
-  return phase * (numClass + 1) + cluster;
-}
-
-static void getFlux(UserDataType *data, N_Vector y, realtype J[])
-{
-  realtype *yd;
-  yd = NV_DATA_S(y);
-  realtype solP[numCalcPhase], wp[numComp], sumwp, wpEff;
-  int pref; 
-  /*pref is used to refer to the real phase for both homo and heter
-  nucleated phases, pref=0 is T3 phase, pref=1 is T6 phase*/
-  for (int p = 0; p < numPhase; p++)
-  {
-    solP[p] = 1;
-    for (int c = 0; c < numComp; c++)
-    {
-      solP[p] = solP[p] * pow(yd[neq - numComp + c], IMaterial->X[p][c]); 
-      /*Calculate solute product for homogeneous nucleation phase*/
-      /*homogeneous nucleation grows from monomer*/
-    }
-  }
-  for (int p = numPhase; p < numCalcPhase; p++)
-  {
-    solP[p] = 1E-30; 
-    /*solute product for heterogeneous nucleation phase*/
-    /*heterogeneous nucleation is caused by irradiation cascade damage*/
-  }
-  for (int p = 0; p < numCalcPhase; p++)
-  {
-    pref = p % numPhase;
-    J[fluxIndex(p, 0)] = ZERO;
-    yd[p * numClass] = solP[p]; /*Effective monomer concentration*/
-    sumwp = 0;
-    for (int c = 0; c < numComp; c++)
-    {
-      wp[c] = yd[neq - numComp + c] * D[c] * data->beta[pref][0];
-      sumwp = sumwp + (nu[pref][c] / wp[c]);
-    }
-    wpEff = 1.0 / sumwp; // md.[14]
-    /*Absorption rate for momoner to dimer*/
-    /*conservation of mass: yd[p*numClass] is the init monomer concentration which should be shared between phases */
-    J[fluxIndex(p, 1)] = wpEff * (yd[p * numClass] / numPhase - 
-                        (IMaterial->solPBar[pref] / solP[pref]) * data->delG[pref][1] *
-                        yd[p * numClass + 1]);
-    /*flux from monomer to dimer*/
-    for (int i = 2; i < numClass; i++)
-    {
-      sumwp = 0;
-      for (int c = 0; c < numComp; c++)
-      {
-        wp[c] = yd[neq - numComp + c] * D[c] * data->beta[pref][i - 1];
-        sumwp = sumwp + (nu[pref][c] / wp[c]);
-      }
-      wpEff = 1.0 / sumwp;
-      J[fluxIndex(p, i)] =  wpEff * (yd[p * numClass + i - 1] -
-                            (IMaterial->solPBar[pref] / solP[pref]) * data->delG[pref][i] *
-                            yd[p * numClass + i]); 
-                            /*flux from size i to size i+1*/
-    }
-    J[fluxIndex(p, numClass)] = ZERO;
-  }
-  return;
-}
-
-/**********************************************************************************
-
-This function calculates Eq. SI-1, the change of concentration of each cluster
-size
-
-***********************************************************************************/
-
-static int f(realtype t, N_Vector y, N_Vector ydot, void *user_data)
-{
-  realtype *yd, *ydotd;
-  yd = NV_DATA_S(y);
-  ydotd = NV_DATA_S(ydot);
-  UserDataType *data;
-
-  int pref;
-  realtype solP[numPhase];
-  realtype GR;
-
-  data = static_cast<UserDataType *>(user_data);
-
-  getFlux(data, y, data->J);
-
-  realtype sumNdot[numCalcPhase], Cdot;
-  for (int p = 0; p < numCalcPhase; p++)
-  {
-    sumNdot[p] = ZERO;
-    ydotd[p * numClass] = ZERO;
-    for (int i = 1; i < numClass; i++)
-    {
-      ydotd[p * numClass + i] = data->J[fluxIndex(p, i)] - data->J[fluxIndex(p, i + 1)]; /*Eq. 1 in Sec. 2.1 without Rhet term*/
-      sumNdot[p] = sumNdot[p] + ydotd[p * numClass + i] * data->size[i]; /*Monomer consumed*/
-    }
-  }
-  for (int p = numPhase; p < numCalcPhase; p++)
-  {
-    pref = p % numPhase;
-    solP[pref] = 1;
-    for (int c = 0; c < numComp; c++)
-    {
-      solP[pref] = solP[pref] * pow(yd[neq - numComp + c], IMaterial->X[pref][c]); /*solute product*/
-    }
-  }
-
-  /*The next three lines is the generation of clusters in cascade damage*/
-  GR = IProp->Alpha * Flux * IProp->ccs * solP[IProp->HGPhase] / IProp->RsolP;
-  /*Generation rate of clusters, Eq. 5 in Sec. 2.2*/
-  ydotd[(IProp->HGPhase + numPhase) * numClass + IProp->HGSize - 1] += GR; 
-  /*Add Rhet term to Eq. (1) in Sec. 2.1*/
-  sumNdot[(IProp->HGPhase + numPhase)] += GR * data->size[IProp->HGSize - 1]; 
-  /*Calculate the monomers consumed in heterogeneous nucleation*/
-
-  for (int c = 0; c < numComp; c++)
-  {
-    Cdot = 0;
-    for (int p = 0; p < numCalcPhase; p++)
-    {
-      pref = p % numPhase;
-      Cdot = Cdot + IMaterial->X[pref][c] * sumNdot[p];
-    }
-    ydotd[neq - numComp + c] = -Cdot; /*change of solute/monomer in matrix*/
-  }
-
-  return (0);
+    return 0;
 }
 
 /*****************************************************************
@@ -540,35 +459,54 @@ This function calculates mean cluster radius and cluster density
 
 *****************************************************************/
 
-static void getOutput(N_Vector y, realtype radM1[numCalcPhase],
-                      realtype radM2[numCalcPhase],
-                      realtype rhoC[numCalcPhase])
-{
-  realtype *yd, numC, numCxSize1, numCxSize2;
-  yd = NV_DATA_S(y);
-  int pref;
-  for (int p = 0; p < numCalcPhase; p++)
-  {
-    pref = p % numPhase;
-    numC = 0;
-    numCxSize1 = 0;
-    numCxSize2 = 0;
-    radM1[p] = 0;
-    radM2[p] = 0;
-    rhoC[p] = 0;
-    for (int i = CutoffSize; i < numClass; i++)
-    {
-      realtype clusterSize = static_cast<realtype>(i + 1);
-      realtype clusterRadius = pow(3 * IMaterial->cVol[pref] * clusterSize / (4 * pi), 1. / 3.);
-      numC = numC + yd[p * numClass + i];
-      numCxSize1 = numCxSize1 + yd[p * numClass + i] * clusterRadius;
-      numCxSize2 = numCxSize2 + yd[p * numClass + i] * clusterSize;
+/**
+ * 从矩变量计算物理输出：平均半径和数量密度
+ */
+static void getOutput(N_Vector y, realtype radM1[numCalcPhase], realtype radM2[numCalcPhase], realtype rhoC[numCalcPhase]) {
+    realtype *yd = NV_DATA_S(y);
+    int M1_off = numGroups;
+
+    for (int p = 0; p < numCalcPhase; p++) {
+        int p_base = p * numGroups * 2;
+        int pref = p % numPhase;
+
+        realtype total_M0 = 0.0;
+        realtype sum_Ri_M0 = 0.0;
+        realtype total_M1 = 0.0;
+
+        // 遍历所有组，统计大于 CutoffSize 的集群
+        for (int g = 0; g < numGroups; g++) {
+            if (GMap[g].n_max < CutoffSize) continue;
+
+            realtype M0 = yd[p_base + g];
+            realtype M1 = yd[p_base + g + M1_off];
+            
+            if (M0 < 1e-35) continue;
+
+            // 计算该组当前的平均尺寸 n_avg = M1 / M0
+            realtype n_avg = M1 / M0;
+            // 计算对应的半径 R(n_avg)
+            realtype r_avg = pow(3.0 * IMaterial->cVol[pref] * n_avg / (4.0 * pi), 1.0 / 3.0);
+
+            total_M0 += M0;
+            sum_Ri_M0 += r_avg * M0;
+            total_M1 += M1;
+        }
+
+        if (total_M0 > 1e-35) {
+            // 方法 1: 算术平均半径 \sum(R_i * N_i) / \sum N_i
+            radM1[p] = sum_Ri_M0 / total_M0;
+
+            // 方法 2: 等效体积半径 R(\sum n_i * N_i / \sum N_i)
+            realtype n_mean = total_M1 / total_M0;
+            radM2[p] = pow((n_mean * IMaterial->cVol[pref]) / ((4.0 / 3.0) * pi), 1.0 / 3.0);
+
+            // 数量密度 (单位: 1/m^3)
+            rhoC[p] = total_M0 / IMaterial->aVol;
+        } else {
+            radM1[p] = 0.0; radM2[p] = 0.0; rhoC[p] = 0.0;
+        }
     }
-    radM1[p] = numCxSize1 / numC;
-    radM2[p] = pow((numCxSize2 / numC * IMaterial->cVol[pref]) / ((4. / 3.) * pi), (1. / 3.));
-    rhoC[p] = numC / IMaterial->aVol;
-  }
-  return;
 }
 
 /**********************************************************************************************
@@ -577,57 +515,35 @@ This function prints cluster size distribution in the file Profile for the final
 solution time.
 
 ***********************************************************************************************/
-static void printYVector(N_Vector y)
-{
-  realtype *yd;
-  ofstream P_file;
-  yd = NV_DATA_S(y);
-  int pref;
+/**
+ * 输出分组后的尺寸分布快照
+ */
+static void printYVector(N_Vector y, int runIdx) {
+    realtype *yd = NV_DATA_S(y);
+    int M1_off = numGroups;
 
-  for (int p = 0; p < numCalcPhase; p++)
-  {
-    pref = p % numPhase;
-    string profStr = "Profile_";
-    string phaseStr;
-    int_to_string(p, phaseStr, 10);
-    profStr.append(phaseStr);
-    P_file.open(profStr.c_str());
-    P_file << "cluster size (# atoms)\tcluster radius (m)\tcluster density (1/m3)" << endl;
-    for (int i = 0; i < numClass; i++)
-    {
-      realtype clusterSize = static_cast<realtype>(i + 1);
-      // 同样，直接计算即可
-      realtype clusterRadius =
-          pow(3 * IMaterial->cVol[pref] * clusterSize / (4 * pi), 1. / 3.);
-      P_file << clusterSize << "\t" << clusterRadius << "\t"
-             << yd[p * numClass + i] / IMaterial->aVol << endl;
+    for (int p = 0; p < numCalcPhase; p++) {
+        int pref = p % numPhase;
+        string profStr = "Profile_P" + to_string(p) + "_Run" + to_string(runIdx) + ".txt";
+        ofstream P_file(profStr);
+
+        P_file << "n_min\tn_max\tn_avg\tradius(m)\tdensity(1/m3)" << endl;
+
+        int p_base = p * numGroups * 2;
+        for (int g = 0; g < numGroups; g++) {
+            realtype M0 = yd[p_base + g];
+            realtype M1 = yd[p_base + g + M1_off];
+            
+            realtype n_avg = (M0 > 1e-35) ? (M1 / M0) : GMap[g].n_center;
+            realtype r_avg = pow(3.0 * IMaterial->cVol[pref] * n_avg / (4.0 * pi), 1.0 / 3.0);
+            
+            // 注意：输出密度时要除以组宽度，得到单位尺寸的浓度
+            P_file << GMap[g].n_min << "\t" 
+                   << GMap[g].n_max << "\t"
+                   << n_avg << "\t"
+                   << r_avg << "\t"
+                   << (M0 / GMap[g].width) / IMaterial->aVol << endl;
+        }
+        P_file.close();
     }
-    P_file.close();
-  }
-  return;
-}
-
-void int_to_string(int i, string &a, int base)
-{
-  int ii = i;
-  string aa;
-  int remain = ii % base;
-
-  if (ii == 0)
-  {
-    a.push_back(ii + 48);
-    return;
-  }
-
-  while (ii > 0)
-  {
-    aa.push_back(ii % base + 48);
-    ii = (ii - remain) / base;
-    remain = ii % base;
-  }
-  for (ii = aa.size() - 1; ii >= 0; ii--)
-  {
-    a.push_back(aa[ii]);
-  }
-  return;
 }

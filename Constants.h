@@ -9,6 +9,18 @@
 typedef sunrealtype realtype;
 #endif
 
+// 二元分组法
+#define numDiscrete 100       // 前100个集群保持离散（每组1个）
+#define numGroups 400         // 总分组数（包含离散和分组部分）
+#define groupingFactor 1.02   // 分组宽度增长因子
+
+struct GroupMap {
+    realtype n_min;   // 组内最小原子数
+    realtype n_max;   // 组内最大原子数
+    realtype width;   // 组宽度 (n_max - n_min + 1)
+    realtype n_center; // 组中心尺寸 (用于简化计算或初始化)
+};
+
 #define ZERO RCONST(0.0) // zero
 #define ONE RCONST(1.0)  // one
 #define TWO RCONST(2.0)  // two
@@ -26,9 +38,12 @@ typedef sunrealtype realtype;
 #define T0 ZERO // Initial time
 
 #define numCalcPhase (numPhase * 2) // number of calculating phases,including both home and heter nucleated phases
-#define neq (numCalcPhase * numClass + numComp) // number of ODEs
+#define neq (numCalcPhase * numClass * 2 + numComp) // number of ODEs
 
 #define RTOL RCONST(1.0E-6) // rel tolerance
 #define ATOL RCONST(ZERO)   // abs tolerance
+
+// Constants.h 增加内容
+#define neq_groups (numCalcPhase * numGroups * 2 + numComp)
 
 #endif
