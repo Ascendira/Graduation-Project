@@ -18,18 +18,14 @@ typedef sunrealtype realtype;
 
 #define numPhase 2 // Number of precipitating phases
 #define numComp 3  // Number of precipitating components
-// #define numComp 4 // Number of precipitating components
-#define numClass                                                               \
-  50000         // Number of cluster classes/maximum cluster size considered
+#define numClass 50000 // Number of cluster classes/maximum cluster size considered
 #define runs 70 // Number of loops to run
 #define CutoffSize 65 // Cutoff size used for output
 #define RadiusCalc                                                             \
   radM2 // Method to calculate mean radius of precipitate, radM1 or radM2
 #define T0 ZERO // Initial time
 
-#define numCalcPhase                                                           \
-  (numPhase * 2) // number of calculating phases,including both home and heter
-                 // nucleated phases
+#define numCalcPhase (numPhase * 2) // number of calculating phases,including both home and heter nucleated phases
 #define neq (numCalcPhase * numClass + numComp) // number of ODEs
 
 #define RTOL RCONST(1.0E-6) // rel tolerance
