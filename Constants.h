@@ -31,7 +31,7 @@ struct GroupMap {
 #define numPhase 2 // Number of precipitating phases
 #define numComp 3  // Number of precipitating components
 #define numClass 50000 // Number of cluster classes/maximum cluster size considered
-#define runs 70 // Number of loops to run
+#define runs 50 // Number of loops to run
 #define CutoffSize 65 // Cutoff size used for output
 #define RadiusCalc                                                             \
   radM2 // Method to calculate mean radius of precipitate, radM1 or radM2

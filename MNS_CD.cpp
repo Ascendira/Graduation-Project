@@ -1,5 +1,5 @@
 // Code developed by Huibin Ke from UW-Madison for the evolution of Mn-Ni-Si precipitates.
-// Modified to implement Binary Grouping Method (Method of Moments) 
+// Modified to implement Binary Grouping Method (Method of Moments)
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,11 +16,11 @@
 #include <sundials/sundials_math.h>  /* contains the macros ABS, SQR, and EXP */
 
 // 兼容 SUNDIALS 现代版本的线性解法器头文件
-#include <sunmatrix/sunmatrix_band.h> 
-#include <sunlinsol/sunlinsol_band.h> 
+#include <sunmatrix/sunmatrix_band.h>
+#include <sunlinsol/sunlinsol_band.h>
 
-#include "Input.h"          /*Input parameter header file*/
-#include "Constants.h"      /*Constants header file*/
+#include "Input.h"     /*Input parameter header file*/
+#include "Constants.h" /*Constants header file*/
 
 using namespace std;
 
@@ -28,33 +28,38 @@ InputCondition *ICond;
 InputMaterial *IMaterial;
 InputProperty *IProp;
 
-realtype D[numComp], aP[numPhase], nu[numPhase][numComp]; 
-realtype Flux, solProd[numPhase]; 
+realtype D[numComp], aP[numPhase], surfTerm[numPhase], nu[numPhase][numComp];
+realtype Flux, solProd[numPhase];
 
 GroupMap GMap[numGroups];
 
 // 供 CVODE 传递给导数函数 f 的自定义数据结构
-struct UserDataType {
+struct UserDataType
+{
     realtype *n_center;
     realtype **radGroup;
     realtype **beta_group;
     realtype *J_M0;
     realtype *J_M1;
 
-    UserDataType() {
+    UserDataType()
+    {
         n_center = new realtype[numGroups]();
-        radGroup = new realtype*[numPhase];
-        beta_group = new realtype*[numPhase];
-        for (int p = 0; p < numPhase; p++) {
+        radGroup = new realtype *[numPhase];
+        beta_group = new realtype *[numPhase];
+        for (int p = 0; p < numPhase; p++)
+        {
             radGroup[p] = new realtype[numGroups]();
             beta_group[p] = new realtype[numGroups]();
         }
-        J_M0 = new realtype[numCalcPhase * numGroups]();
-        J_M1 = new realtype[numCalcPhase * numGroups]();
+        J_M0 = new realtype[numCalcPhase * numGroups + 1]();
+        J_M1 = new realtype[numCalcPhase * numGroups + 1]();
     }
-    ~UserDataType() {
+    ~UserDataType()
+    {
         delete[] n_center;
-        for (int p = 0; p < numPhase; p++) {
+        for (int p = 0; p < numPhase; p++)
+        {
             delete[] radGroup[p];
             delete[] beta_group[p];
         }
@@ -72,7 +77,8 @@ static void initParams();
 static void GetRED(realtype D[numComp], realtype Flux);
 static void initGrouping();
 static realtype getAvgN(realtype M0, realtype M1, int groupIdx);
-static int findGroupIndex(realtype n);
+static int fluxIndex(int phase, int cluster);
+static int cluNumTGroupIndex(realtype n);
 static void getGroupFlux(UserDataType *data, N_Vector y, realtype *J_M0, realtype *J_M1);
 static int f(realtype t, N_Vector y, N_Vector ydot, void *user_data);
 static void getOutput(N_Vector y, realtype radM1[numCalcPhase], realtype radM2[numCalcPhase], realtype rhoC[numCalcPhase]);
@@ -82,7 +88,8 @@ void int_to_string(int i, string &a, int base);
 /* =========================================================================
  * 主函数 MAIN
  * ========================================================================= */
-int main() {
+int main()
+{
     realtype t, tout = 1E0;
     double ts = 0.0;
     int mxsteps = 2000000;
@@ -96,7 +103,7 @@ int main() {
     IProp = new InputProperty();
 
     LoadInput(ICond, IMaterial, IProp);
-    
+
     // 初始化物理参数和分组地图
     initParams();
     initGrouping();
@@ -106,17 +113,21 @@ int main() {
     realtype *yd = NV_DATA_S(y0);
 
     // 初始值填充 (极小值避免除0错误)
-    for (int i = 0; i < neq_groups; i++) yd[i] = 1E-30;
+    for (int i = 0; i < neq_groups; i++)
+        yd[i] = 1E-30;
 
     // 矩阵溶质初始浓度
-    for (int c = 0; c < numComp; c++) {
+    for (int c = 0; c < numComp; c++)
+    {
         yd[neq_groups - numComp + c] = IMaterial->C0[c];
     }
 
     // 单体初始平衡浓度映射到每相的第一个组
-    for (int p = 0; p < numPhase; p++) {
+    for (int p = 0; p < numPhase; p++)
+    {
         solProd[p] = 1.0;
-        for (int c = 0; c < numComp; c++) {
+        for (int c = 0; c < numComp; c++)
+        {
             solProd[p] *= pow(IMaterial->C0[c], IMaterial->X[p][c]);
         }
         int p_base = p * numGroups * 2;
@@ -127,7 +138,8 @@ int main() {
     // 3. 配置求解器和数据
     void *cvode_mem = CVodeCreate(CV_BDF, sunctx);
     UserDataType *data = new UserDataType();
-    for(int g = 0; g < numGroups; g++) {
+    for (int g = 0; g < numGroups; g++)
+    {
         data->n_center[g] = GMap[g].n_center;
     }
     CVodeSetUserData(cvode_mem, data);
@@ -141,14 +153,26 @@ int main() {
     CVodeSetLinearSolver(cvode_mem, LS, A);
 
     // 4. 打开主输出文件
-    ofstream O_file("Output_Grouping.txt");
+    string dir = "../data/output";
+    std::filesystem::path dirPath(dir);
+    if (!std::filesystem::exists(dirPath))
+    {
+        if (!std::filesystem::create_directories(dirPath))
+            return 0;
+    }
+
+    ofstream O_file(dir + "/Output_Grouping.txt");
     O_file << "Run\tCalcTime(s)\tTime(s)\tFluence(n/m2s)\t";
-    for(int p = 0; p < numPhase; p++){
-        string ps; int_to_string(p+1, ps, 10);
+    for (int p = 0; p < numPhase; p++)
+    {
+        string ps;
+        int_to_string(p + 1, ps, 10);
         O_file << "Rad_P" + ps + "_Homo(m)\tRho_P" + ps + "_Homo(1/m3)\t";
     }
-    for(int p = 0; p < numPhase; p++){
-        string ps; int_to_string(p+1, ps, 10);
+    for (int p = 0; p < numPhase; p++)
+    {
+        string ps;
+        int_to_string(p + 1, ps, 10);
         O_file << "Rad_P" + ps + "_Heter(m)\tRho_P" + ps + "_Heter(1/m3)\t";
     }
     O_file << "Mn\tNi\tSi" << endl;
@@ -156,15 +180,17 @@ int main() {
     realtype radM1_out[numCalcPhase], radM2_out[numCalcPhase], rhoC_out[numCalcPhase];
 
     // 5. 主循环计算
-    for (int i = 0; i < runs; i++) {
+    for (int i = 0; i < runs; i++)
+    {
         time_t tik, tok;
         time(&tik);
-        
+
         int flag = CVode(cvode_mem, tout, y0, &t, CV_NORMAL);
-        
+
         time(&tok);
 
-        if (flag < 0) {
+        if (flag < 0)
+        {
             cerr << "CVODE Error: flag=" << flag << " at run " << i << endl;
             break;
         }
@@ -174,13 +200,14 @@ int main() {
 
         realtype *yd_final = NV_DATA_S(y0);
         O_file << i << "\t" << difftime(tok, tik) << "\t" << t << "\t" << t * Flux << "\t";
-        
-        for (int p = 0; p < numCalcPhase; p++) {
+
+        for (int p = 0; p < numCalcPhase; p++)
+        {
             O_file << radM2_out[p] << "\t" << rhoC_out[p] << "\t";
         }
-        
-        O_file << yd_final[neq_groups - 3] << "\t" 
-               << yd_final[neq_groups - 2] << "\t" 
+
+        O_file << yd_final[neq_groups - 3] << "\t"
+               << yd_final[neq_groups - 2] << "\t"
                << yd_final[neq_groups - 1] << endl;
 
         tout *= 1.5;
@@ -203,63 +230,88 @@ int main() {
 /* =========================================================================
  * 辅助与初始化函数
  * ========================================================================= */
-static void initParams() {
+static void initParams()
+{
     Flux = ICond->Flux;
-    for(int i = 0; i < numComp; i++) D[i] = IMaterial->D[i];
+    for (int i = 0; i < numComp; i++)
+        D[i] = IMaterial->D[i];
     GetRED(D, Flux);
-    for(int p = 0; p < numPhase; p++){
+    for (int p = 0; p < numPhase; p++)
+    {
         aP[p] = pow((3 * IMaterial->cVol[p]) / (4 * pi), 1. / 3.);
-        for(int c = 0; c < numComp; c++){
+        surfTerm[p] = 4.0 * pi * IMaterial->sig[p] * pow((3.0 * IMaterial->cVol[p]) / (4.0 * pi), 2.0 / 3.0) / (kb * ICond->Temp);
+        for (int c = 0; c < numComp; c++)
+        {
             nu[p][c] = pow(IMaterial->X[p][c], 2);
         }
     }
 }
 
-static void GetRED(realtype D[numComp], realtype Flux) {
+static void GetRED(realtype D[numComp], realtype Flux)
+{
     realtype Eta, Gs, Cvr;
-    if (Flux > IProp->Rflux) {
+    if (Flux > IProp->Rflux)
+    {
         Eta = 16 * pi * IProp->rv * IProp->DCB * IProp->SigmaDpa * IProp->Rflux / IMaterial->aVol / IProp->DV / pow(IProp->DDP, 2);
         Gs = 2.0 / Eta * (pow(1 + Eta, 0.5) - 1.0) * pow((IProp->Rflux / Flux), IProp->p_factor);
-    } else {
+    }
+    else
+    {
         Eta = 16 * pi * IProp->rv * IProp->DCB * IProp->SigmaDpa * Flux / IMaterial->aVol / IProp->DV / pow(IProp->DDP, 2);
         Gs = 2.0 / Eta * (pow(1 + Eta, 0.5) - 1.0);
     }
     Cvr = IProp->DCB * Flux * IProp->SigmaDpa * Gs / (IProp->DV * IProp->DDP);
-    for(int i = 0; i < numComp; i++) {
+    for (int i = 0; i < numComp; i++)
+    {
         D[i] = D[i] + IProp->DV * Cvr * D[i] / IMaterial->DFe;
     }
 }
 
-static void initGrouping() {
+static void initGrouping()
+{
     realtype current_n = 1.0;
     realtype current_width = 1.0;
-    for (int g = 0; g < numGroups; g++) {
+    for (int g = 0; g < numGroups; g++)
+    {
         GMap[g].n_min = current_n;
-        if (g < numDiscrete) {
+        if (g < numDiscrete)
+        {
             GMap[g].width = 1.0;
-        } else {
+            GMap[g].n_max = GMap[g].n_min;
+            GMap[g].n_center = GMap[g].n_min;
+        }
+        else
+        {
             current_width *= groupingFactor;
             GMap[g].width = std::max(1.0, std::round(current_width));
+            GMap[g].n_max = GMap[g].n_min + GMap[g].width - 1.0;
+            GMap[g].n_center = (GMap[g].n_min + GMap[g].n_max) / 2.0;
         }
-        GMap[g].n_max = GMap[g].n_min + GMap[g].width - 1.0;
-        GMap[g].n_center = (GMap[g].n_min + GMap[g].n_max) / 2.0;
         current_n = GMap[g].n_max + 1.0;
     }
-    cout << "Grouping init complete. Max cluster size: " << GMap[numGroups-1].n_max << " atoms" << endl;
+    cout << "Grouping init complete. Max cluster size: " << GMap[numGroups - 1].n_max << " atoms" << endl;
 }
 
-static realtype getAvgN(realtype M0, realtype M1, int groupIdx) {
-    if (M0 < 1e-35) return GMap[groupIdx].n_center;
+static realtype getAvgN(realtype M0, realtype M1, int groupIdx)
+{
+    if (groupIdx < numDiscrete || M0 < 1e-35)
+        return GMap[groupIdx].n_center;
     realtype n_avg = M1 / M0;
-    if (n_avg < GMap[groupIdx].n_min) return GMap[groupIdx].n_min;
-    if (n_avg > GMap[groupIdx].n_max) return GMap[groupIdx].n_max;
+    if (n_avg < GMap[groupIdx].n_min)
+        return GMap[groupIdx].n_min;
+    if (n_avg > GMap[groupIdx].n_max)
+        return GMap[groupIdx].n_max;
     return n_avg;
 }
 
-static int findGroupIndex(realtype n) {
-    if (n < 1) return 0;
-    for (int g = 0; g < numGroups; g++) {
-        if (n >= GMap[g].n_min && n <= GMap[g].n_max) return g;
+static int cluNumTGroupIndex(realtype n)
+{
+    if (n < 1)
+        return 0;
+    for (int g = 0; g < numGroups; g++)
+    {
+        if (n >= GMap[g].n_min && n <= GMap[g].n_max)
+            return g;
     }
     return numGroups - 1;
 }
@@ -267,104 +319,188 @@ static int findGroupIndex(realtype n) {
 /* =========================================================================
  * 核心：分组法通量与 ODE 方程 (getGroupFlux & f)
  * ========================================================================= */
-static void getGroupFlux(UserDataType *data, N_Vector y, realtype *J_M0, realtype *J_M1) {
+static int fluxIndex(int phase, int groupIdx)
+{
+    return phase * (numGroups + 1) + groupIdx;
+}
+
+static void getGroupFlux(UserDataType *data, N_Vector y, realtype *J_M0, realtype *J_M1)
+{
     realtype *yd = NV_DATA_S(y);
     int M1_off = numGroups;
-    realtype solP[numCalcPhase];
+    realtype solP[numCalcPhase], sumwp, wp, wpEff;
 
-    for (int p = 0; p < numPhase; p++) {
+    for (int p = 0; p < numPhase; p++)
+    {
         solP[p] = 1.0;
-        for (int c = 0; c < numComp; c++) {
+        for (int c = 0; c < numComp; c++)
+        {
             solP[p] *= pow(yd[neq_groups - numComp + c], IMaterial->X[p][c]);
         }
     }
-    for (int p = numPhase; p < numCalcPhase; p++) solP[p] = 1E-30;
+    for (int p = numPhase; p < numCalcPhase; p++)
+        solP[p] = 1E-30;
 
-    for (int p = 0; p < numCalcPhase; p++) {
+    for (int p = 0; p < numCalcPhase; p++)
+    {
         int pref = p % numPhase;
         int p_base = p * numGroups * 2;
 
-        for (int g = 0; g < numGroups - 1; g++) {
+        J_M0[fluxIndex(p, 0)] = ZERO;
+        J_M1[fluxIndex(p, 0)] = ZERO;
+
+        realtype r_b_0 = pow(3.0 * IMaterial->cVol[pref] * 1.0 / (4.0 * pi), 1.0 / 3.0);
+        sumwp = 0;
+        for (int c = 0; c < numComp; c++)
+        {
+            realtype wp = yd[neq_groups - numComp + c] * D[c] * ((4.0 * pi * r_b_0) / IMaterial->aVol);
+            sumwp += (nu[pref][c] / wp);
+        }
+        wpEff = 1.0 / sumwp;
+
+        realtype C_right_0 = yd[p_base] / numPhase;
+        realtype C_left_1 = yd[p_base + 1];
+
+        realtype delG_boundary_0 = exp(surfTerm[pref] * (pow(2.0, 2.0 / 3.0) - pow(1.0, 2.0 / 3.0)));
+        realtype emission_ratio_0 = (IMaterial->solPBar[pref] / std::max(solP[pref], 1e-30)) * delG_boundary_0;
+
+        realtype forward_flux_0 = wpEff * C_right_0;
+        realtype backward_flux_0 = wpEff * emission_ratio_0 * C_left_1;
+
+        J_M0[fluxIndex(p, 1)] = forward_flux_0 - backward_flux_0;
+        J_M1[fluxIndex(p, 1)] = forward_flux_0 * 1.0 - backward_flux_0 * 2.0;
+
+        for (int g = 2; g < numGroups; g++)
+        {
+            realtype M0_gm1 = yd[p_base + g - 1];
+            realtype M1_gm1 = yd[p_base + g + M1_off - 1];
+
             realtype M0_g = yd[p_base + g];
             realtype M1_g = yd[p_base + g + M1_off];
-            
-            realtype n_avg = getAvgN(M0_g, M1_g, g);
-            realtype r_avg = pow(3.0 * IMaterial->cVol[pref] * n_avg / (4.0 * pi), 1.0 / 3.0);
-            
-            realtype sumwp = 0;
-            for(int c = 0; c < numComp; c++){
-                realtype wp = yd[neq_groups - numComp + c] * D[c] * ((4.0 * pi * aP[pref] * r_avg) / IMaterial->aVol);
-                if (wp > 0) sumwp += (nu[pref][c] / wp);
+
+            // 1. 评估界面处的吸收速率 (wpEff) 和发射速率修正 (emission_ratio)
+            realtype n_b = GMap[g - 1].n_max;
+            realtype r_b = pow(3.0 * IMaterial->cVol[pref] * n_b / (4.0 * pi), 1.0 / 3.0);
+
+            sumwp = 0;
+            for (int c = 0; c < numComp; c++)
+            {
+                wp = yd[neq_groups - numComp + c] * D[c] * ((4.0 * pi * r_b) / IMaterial->aVol);
+                sumwp += (nu[pref][c] / wp);
             }
-            realtype wpEff = (sumwp > 0) ? (1.0 / sumwp) : 0.0;
-            
-            realtype C_boundary = 0.0;
-            if (M0_g > 1e-35) {
-                realtype delta_n = n_avg - GMap[g].n_center;
-                realtype slope = (GMap[g].width > 1.0) ? (12.0 * delta_n / (GMap[g].width * GMap[g].width)) : 0.0;
-                C_boundary = (M0_g / GMap[g].width) * (1.0 + slope * (GMap[g].n_max - GMap[g].n_center));
-                if (C_boundary < 0.0) C_boundary = 0.0;
+            wpEff = 1.0 / sumwp;
+
+            // 2. 评估界面左侧浓度 (C_right_g) -> 驱动向右的生长通量
+            realtype C_right_g = 0.0;
+            if (M0_gm1 > 1e-35)
+            {
+                if (g < numDiscrete)
+                {
+                    // 【精确区】：浓度就是 M0 本身，不需要插值
+                    C_right_g = M0_gm1;
+                }
+                else
+                {
+                    // 【分组区】：使用差值法线性重构右边界浓度
+                    realtype n_avg_gm1 = getAvgN(M0_gm1, M1_gm1, g - 1);
+                    realtype delta_n_gm1 = n_avg_gm1 - GMap[g - 1].n_center;
+                    realtype slope_gm1 = 12.0 * delta_n_gm1 / (GMap[g - 1].width * GMap[g - 1].width);
+                    C_right_g = (M0_gm1 / GMap[g - 1].width) * (1.0 + slope_gm1 * (n_b - GMap[g - 1].n_center));
+                }
             }
 
-            realtype flux = wpEff * (C_boundary - (IMaterial->solPBar[pref] / solP[pref]) * C_boundary); 
+            // 3. 评估界面右侧浓度 (C_left_gp1) -> 驱动向左的溶解通量
+            realtype C_left_g = 0.0;
+            if (M0_g > 1e-35)
+            {
+                if (GMap[g].width == 1.0)
+                {
+                    // 下一组依然是精确区
+                    C_left_g = M0_g;
+                }
+                else
+                {
+                    // 下一组是分组区 (完美涵盖了交界处情况)
+                    realtype n_avg_g = getAvgN(M0_g, M1_g, g);
+                    realtype delta_n_g = n_avg_g - GMap[g].n_center;
+                    realtype slope_g = 12.0 * delta_n_g / (GMap[g].width * GMap[g].width);
+                    C_left_g = (M0_g / GMap[g].width) * (1.0 + slope_g * (GMap[g].n_min - GMap[g].n_center));
+                }
+            }
 
-            J_M0[p * numGroups + g] = flux;
-            J_M1[p * numGroups + g] = GMap[g].n_max * flux;
+            // 4. 界面能修正与通量计算 (完美迎风格式)
+            realtype delG_boundary = exp(surfTerm[pref] * (pow(n_b + 1.0, 2.0 / 3.0) - pow(n_b, 2.0 / 3.0)));
+            realtype emission_ratio = (IMaterial->solPBar[pref] / solP[pref]) * delG_boundary;
+
+            realtype forward_flux = wpEff * C_right_g;
+            realtype backward_flux = wpEff * emission_ratio * C_left_g;
+
+            J_M0[fluxIndex(p, g)] = forward_flux - backward_flux;
+            J_M1[fluxIndex(p, g)] = forward_flux * n_b - backward_flux * GMap[g + 1].n_min;
         }
-        J_M0[p * numGroups + numGroups - 1] = 0.0;
-        J_M1[p * numGroups + numGroups - 1] = 0.0;
+
+        J_M0[fluxIndex(p, numGroups)] = ZERO;
+        J_M1[fluxIndex(p, numGroups)] = ZERO;
     }
 }
 
-static int f(realtype t, N_Vector y, N_Vector ydot, void *user_data) {
+static int f(realtype t, N_Vector y, N_Vector ydot, void *user_data)
+{
     realtype *yd = NV_DATA_S(y);
     realtype *ydotd = NV_DATA_S(ydot);
     UserDataType *data = static_cast<UserDataType *>(user_data);
-
-    for (int i = 0; i < neq_groups; i++) ydotd[i] = 0.0;
 
     getGroupFlux(data, y, data->J_M0, data->J_M1);
 
     realtype total_sol_cons[numComp] = {0.0, 0.0, 0.0};
 
-    for (int p = 0; p < numCalcPhase; p++) {
+    for (int p = 0; p < numCalcPhase; p++)
+    {
         int pref = p % numPhase;
         int M0_base = p * numGroups * 2;
         int M1_base = M0_base + numGroups;
 
-        for (int g = 0; g < numGroups; g++) {
-            realtype J0_in  = (g == 0) ? 0.0 : data->J_M0[p * numGroups + g - 1];
-            realtype J0_out = data->J_M0[p * numGroups + g];
+        ydotd[M0_base] = ZERO;
+        ydotd[M1_base] = ZERO;
 
-            realtype J1_in  = (g == 0) ? 0.0 : data->J_M1[p * numGroups + g - 1];
-            realtype J1_out = data->J_M1[p * numGroups + g];
+        for (int g = 1; g < numGroups; g++)
+        {
+            realtype J0_in = data->J_M0[fluxIndex(p, g - 1)];
+            realtype J0_out = data->J_M0[fluxIndex(p, g)];
+
+            realtype J1_in = data->J_M1[fluxIndex(p, g - 1)];
+            realtype J1_out = data->J_M1[fluxIndex(p, g)];
 
             ydotd[M0_base + g] = J0_in - J0_out;
             ydotd[M1_base + g] = J1_in - J1_out;
 
-            for (int c = 0; c < numComp; c++) {
+            for (int c = 0; c < numComp; c++)
+            {
                 total_sol_cons[c] += IMaterial->X[pref][c] * ydotd[M1_base + g];
             }
         }
     }
 
     realtype solP_pref = 1.0;
-    for (int c = 0; c < numComp; c++) {
+    for (int c = 0; c < numComp; c++)
+    {
         solP_pref *= pow(yd[neq_groups - numComp + c], IMaterial->X[IProp->HGPhase][c]);
     }
     realtype GR = IProp->Alpha * Flux * IProp->ccs * solP_pref / IProp->RsolP;
 
-    int g_hg = findGroupIndex(IProp->HGSize);
+    int g_hg = cluNumTGroupIndex(IProp->HGSize);
     int p_hg = IProp->HGPhase + numPhase;
 
     ydotd[p_hg * numGroups * 2 + g_hg] += GR;
     ydotd[p_hg * numGroups * 2 + numGroups + g_hg] += IProp->HGSize * GR;
 
-    for (int c = 0; c < numComp; c++) {
+    for (int c = 0; c < numComp; c++)
+    {
         total_sol_cons[c] += IMaterial->X[IProp->HGPhase][c] * (IProp->HGSize * GR);
     }
 
-    for (int c = 0; c < numComp; c++) {
+    for (int c = 0; c < numComp; c++)
+    {
         ydotd[neq_groups - numComp + c] = -total_sol_cons[c];
     }
 
@@ -374,11 +510,13 @@ static int f(realtype t, N_Vector y, N_Vector ydot, void *user_data) {
 /* =========================================================================
  * 输出与格式化函数
  * ========================================================================= */
-static void getOutput(N_Vector y, realtype radM1[numCalcPhase], realtype radM2[numCalcPhase], realtype rhoC[numCalcPhase]) {
+static void getOutput(N_Vector y, realtype radM1[numCalcPhase], realtype radM2[numCalcPhase], realtype rhoC[numCalcPhase])
+{
     realtype *yd = NV_DATA_S(y);
     int M1_off = numGroups;
 
-    for (int p = 0; p < numCalcPhase; p++) {
+    for (int p = 0; p < numCalcPhase; p++)
+    {
         int pref = p % numPhase;
         int p_base = p * numGroups * 2;
 
@@ -386,13 +524,16 @@ static void getOutput(N_Vector y, realtype radM1[numCalcPhase], realtype radM2[n
         realtype sum_Ri_M0 = 0.0;
         realtype total_M1 = 0.0;
 
-        for (int g = 0; g < numGroups; g++) {
-            if (GMap[g].n_max < CutoffSize) continue;
+        for (int g = 0; g < numGroups; g++)
+        {
+            if (GMap[g].n_max < CutoffSize)
+                continue;
 
             realtype M0 = yd[p_base + g];
             realtype M1 = yd[p_base + g + M1_off];
-            
-            if (M0 < 1e-35) continue;
+
+            if (M0 < 1e-35)
+                continue;
 
             realtype n_avg = M1 / M0;
             realtype r_avg = pow(3.0 * IMaterial->cVol[pref] * n_avg / (4.0 * pi), 1.0 / 3.0);
@@ -402,39 +543,54 @@ static void getOutput(N_Vector y, realtype radM1[numCalcPhase], realtype radM2[n
             total_M1 += M1;
         }
 
-        if (total_M0 > 1e-35) {
-            radM1[p] = sum_Ri_M0 / total_M0; 
+        if (total_M0 > 1e-35)
+        {
+            radM1[p] = sum_Ri_M0 / total_M0;
             realtype n_mean = total_M1 / total_M0;
             radM2[p] = pow((n_mean * IMaterial->cVol[pref]) / ((4.0 / 3.0) * pi), 1.0 / 3.0);
-            rhoC[p] = total_M0 / IMaterial->aVol; 
-        } else {
-            radM1[p] = 0.0; radM2[p] = 0.0; rhoC[p] = 0.0;
+            rhoC[p] = total_M0 / IMaterial->aVol;
+        }
+        else
+        {
+            radM1[p] = 0.0;
+            radM2[p] = 0.0;
+            rhoC[p] = 0.0;
         }
     }
 }
 
-static void printYVector(N_Vector y, int runIdx) {
+static void printYVector(N_Vector y, int runIdx)
+{
     realtype *yd = NV_DATA_S(y);
     int M1_off = numGroups;
 
-    for (int p = 0; p < numCalcPhase; p++) {
-        int pref = p % numPhase;
-        string phaseStr;
-        int_to_string(p, phaseStr, 10);
-        string profStr = "Profile_P" + phaseStr + "_Run" + to_string(runIdx) + ".txt";
-        
+    for (int p = 0; p < numCalcPhase; p++)
+    {
+        string dir = "../data/output/Phase_" + to_string(p);
+        std::filesystem::path dirPath(dir);
+        if (!std::filesystem::exists(dirPath))
+        {
+            if (!std::filesystem::create_directories(dirPath))
+                return;
+        }
+        string profStr = dir + "/Run" + to_string(runIdx) + ".txt";
+
         ofstream P_file(profStr.c_str());
+        if (!P_file.is_open())
+            return;
         P_file << "n_min\tn_max\tn_avg\tradius(m)\tdensity(1/m3)" << endl;
 
+        int pref = p % numPhase;
         int p_base = p * numGroups * 2;
-        for (int g = 0; g < numGroups; g++) {
+        for (int g = 0; g < numGroups; g++)
+        {
             realtype M0 = yd[p_base + g];
             realtype M1 = yd[p_base + g + M1_off];
-            
+
             realtype n_avg = (M0 > 1e-35) ? (M1 / M0) : GMap[g].n_center;
             realtype r_avg = pow(3.0 * IMaterial->cVol[pref] * n_avg / (4.0 * pi), 1.0 / 3.0);
-            
-            P_file << GMap[g].n_min << "\t" 
+
+            P_file << GMap[g].n_min << "\t"
                    << GMap[g].n_max << "\t"
                    << n_avg << "\t"
                    << r_avg << "\t"
@@ -444,17 +600,24 @@ static void printYVector(N_Vector y, int runIdx) {
     }
 }
 
-void int_to_string(int i, string &a, int base) {
+void int_to_string(int i, string &a, int base)
+{
     int ii = i;
     string aa;
     int remain = ii % base;
-    if (ii == 0) { a.push_back(ii + 48); return; }
-    while (ii > 0) {
+    if (ii == 0)
+    {
+        a.push_back(ii + 48);
+        return;
+    }
+    while (ii > 0)
+    {
         aa.push_back(ii % base + 48);
         ii = (ii - remain) / base;
         remain = ii % base;
     }
-    for (int j = aa.size() - 1; j >= 0; j--) {
+    for (int j = aa.size() - 1; j >= 0; j--)
+    {
         a.push_back(aa[j]);
     }
 }
