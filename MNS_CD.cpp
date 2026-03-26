@@ -99,6 +99,8 @@ realtype rhoC[numCalcPhase], radM1[numCalcPhase], radM2[numCalcPhase];
 realtype Flux, solProd[numPhase];
 /*Irradiation flux, solute product */
 
+filesystem::path dirPath("../data/output/original");
+
 int main()
 {
   std::vector<realtype> y0data_vec(neq, ZERO); // heap allocation for initial conditions, size neq, initialized to ZERO
@@ -127,8 +129,15 @@ int main()
   y0 = N_VMake_Serial(neq, y0data, sunctx);
 
   /*Write the output file*/
-  ofstream O_file;
-  O_file.open("Output");
+  if (!filesystem::exists(dirPath))
+  {
+    filesystem::create_directories(dirPath);
+  }
+
+  string outputPath = dirPath.string() + "/Output.txt";
+  ofstream O_file(outputPath);
+  if (!O_file.is_open())
+    return -1;
   cout << "Output file absolute path: " << std::filesystem::absolute("Output") << endl;
   O_file << "Run\tCalcTime(s)\tTime(s)\tFluence(n/m2s)\t";
   for (int p = 0; p < numPhase; p++)
@@ -216,25 +225,25 @@ This function initialize parameters used in model
 *************************************************/
 static void initParams()
 {
-  Flux = ICond->Flux; 
+  Flux = ICond->Flux;
   /*Irradiatio flux*/
   for (int i = 0; i < numComp; i++)
   {
-    D[i] = IMaterial->D[i]; 
+    D[i] = IMaterial->D[i];
     /*Thermal diffusion coefficients*/
   }
-  GetRED(D, Flux); 
+  GetRED(D, Flux);
   /*Calculate radiation enhanced diffusion coefficients*/
   for (int p = 0; p < numPhase; p++)
   {
-    aP[p] = pow((3 * IMaterial->cVol[p]) / (4 * pi), 1. / 3.); 
+    aP[p] = pow((3 * IMaterial->cVol[p]) / (4 * pi), 1. / 3.);
     /*Effective atomic radius in precipitate*/
   }
   for (int p = 0; p < numPhase; p++)
   {
     for (int c = 0; c < numComp; c++)
     {
-      nu[p][c] = pow(IMaterial->X[p][c], 2); 
+      nu[p][c] = pow(IMaterial->X[p][c], 2);
       /*Square of precipitate composition*/
     }
   }
@@ -267,11 +276,11 @@ static void GetRED(realtype D[numComp], realtype Flux)
           IMaterial->aVol / IProp->DV / pow(IProp->DDP, 2);
     Gs = 2.0 / Eta * (pow(1 + Eta, 0.5) - 1.0);
   }
-  Cvr = IProp->DCB * Flux * IProp->SigmaDpa * Gs / (IProp->DV * IProp->DDP); 
+  Cvr = IProp->DCB * Flux * IProp->SigmaDpa * Gs / (IProp->DV * IProp->DDP);
   /*Calculate vacancy concentration under irradiation, Eq. SI-17*/
   for (int i = 0; i < numComp; i++)
   {
-    D[i] = D[i] + IProp->DV * Cvr * D[i] / IMaterial ->DFe; /*Radiation enhanced diffusion coefficients, Eq. SI-16*/
+    D[i] = D[i] + IProp->DV * Cvr * D[i] / IMaterial->DFe; /*Radiation enhanced diffusion coefficients, Eq. SI-16*/
   }
 }
 
@@ -354,7 +363,7 @@ static void getDelG(realtype *size, realtype **radClust, realtype **delG)
   {
     for (int i = 1; i < numClass; i++)
     {
-      delta = (IMaterial->sig[p] * 4 * pi * pow(radClust[p][i], TWO)) - 
+      delta = (IMaterial->sig[p] * 4 * pi * pow(radClust[p][i], TWO)) -
               (IMaterial->sig[p] * 4 * pi * pow(radClust[p][i - 1], TWO));
       delG[p][i] = exp(delta / (kb * ICond->Temp));
     }
@@ -380,7 +389,7 @@ static void getInitVals(realtype y0[neq])
   }
   for (int c = 0; c < numComp; c++)
   {
-    y0[neqToNcom + c] = IMaterial->C0[c]; 
+    y0[neqToNcom + c] = IMaterial->C0[c];
     /*Concentration of solute in matrix*/
   }
   for (int p = 0; p < numPhase; p++)
@@ -390,7 +399,7 @@ static void getInitVals(realtype y0[neq])
     {
       solProd[p] = solProd[p] * pow(IMaterial->C0[c], IMaterial->X[p][c]);
     }
-    y0[p * numClass] = solProd[p]; 
+    y0[p * numClass] = solProd[p];
     /*Effective monomer concentration, based on Eq. SI-15*/
     /*The monomer concentration of n=1 set only in the homogeneous phase of T3 and T6 conforms to thermodynamic evolution*/
   }
@@ -413,7 +422,7 @@ static void getFlux(UserDataType *data, N_Vector y, realtype J[])
   realtype *yd;
   yd = NV_DATA_S(y);
   realtype solP[numCalcPhase], wp[numComp], sumwp, wpEff;
-  int pref; 
+  int pref;
   /*pref is used to refer to the real phase for both homo and heter
   nucleated phases, pref=0 is T3 phase, pref=1 is T6 phase*/
   for (int p = 0; p < numPhase; p++)
@@ -421,14 +430,14 @@ static void getFlux(UserDataType *data, N_Vector y, realtype J[])
     solP[p] = 1;
     for (int c = 0; c < numComp; c++)
     {
-      solP[p] = solP[p] * pow(yd[neq - numComp + c], IMaterial->X[p][c]); 
+      solP[p] = solP[p] * pow(yd[neq - numComp + c], IMaterial->X[p][c]);
       /*Calculate solute product for homogeneous nucleation phase*/
       /*homogeneous nucleation grows from monomer*/
     }
   }
   for (int p = numPhase; p < numCalcPhase; p++)
   {
-    solP[p] = 1E-30; 
+    solP[p] = 1E-30;
     /*solute product for heterogeneous nucleation phase*/
     /*heterogeneous nucleation is caused by irradiation cascade damage*/
   }
@@ -446,9 +455,9 @@ static void getFlux(UserDataType *data, N_Vector y, realtype J[])
     wpEff = 1.0 / sumwp; // md.[14]
     /*Absorption rate for momoner to dimer*/
     /*conservation of mass: yd[p*numClass] is the init monomer concentration which should be shared between phases */
-    J[fluxIndex(p, 1)] = wpEff * (yd[p * numClass] / numPhase - 
-                        (IMaterial->solPBar[pref] / solP[pref]) * data->delG[pref][1] *
-                        yd[p * numClass + 1]);
+    J[fluxIndex(p, 1)] = wpEff * (yd[p * numClass] / numPhase -
+                                  (IMaterial->solPBar[pref] / solP[pref]) * data->delG[pref][1] *
+                                      yd[p * numClass + 1]);
     /*flux from monomer to dimer*/
     for (int i = 2; i < numClass; i++)
     {
@@ -459,10 +468,10 @@ static void getFlux(UserDataType *data, N_Vector y, realtype J[])
         sumwp = sumwp + (nu[pref][c] / wp[c]);
       }
       wpEff = 1.0 / sumwp;
-      J[fluxIndex(p, i)] =  wpEff * (yd[p * numClass + i - 1] -
-                            (IMaterial->solPBar[pref] / solP[pref]) * data->delG[pref][i] *
-                            yd[p * numClass + i]); 
-                            /*flux from size i to size i+1*/
+      J[fluxIndex(p, i)] = wpEff * (yd[p * numClass + i - 1] -
+                                    (IMaterial->solPBar[pref] / solP[pref]) * data->delG[pref][i] *
+                                        yd[p * numClass + i]);
+      /*flux from size i to size i+1*/
     }
     J[fluxIndex(p, numClass)] = ZERO;
   }
@@ -499,7 +508,7 @@ static int f(realtype t, N_Vector y, N_Vector ydot, void *user_data)
     for (int i = 1; i < numClass; i++)
     {
       ydotd[p * numClass + i] = data->J[fluxIndex(p, i)] - data->J[fluxIndex(p, i + 1)]; /*Eq. 1 in Sec. 2.1 without Rhet term*/
-      sumNdot[p] = sumNdot[p] + ydotd[p * numClass + i] * data->size[i]; /*Monomer consumed*/
+      sumNdot[p] = sumNdot[p] + ydotd[p * numClass + i] * data->size[i];                 /*Monomer consumed*/
     }
   }
   for (int p = numPhase; p < numCalcPhase; p++)
@@ -515,9 +524,9 @@ static int f(realtype t, N_Vector y, N_Vector ydot, void *user_data)
   /*The next three lines is the generation of clusters in cascade damage*/
   GR = IProp->Alpha * Flux * IProp->ccs * solP[IProp->HGPhase] / IProp->RsolP;
   /*Generation rate of clusters, Eq. 5 in Sec. 2.2*/
-  ydotd[(IProp->HGPhase + numPhase) * numClass + IProp->HGSize - 1] += GR; 
+  ydotd[(IProp->HGPhase + numPhase) * numClass + IProp->HGSize - 1] += GR;
   /*Add Rhet term to Eq. (1) in Sec. 2.1*/
-  sumNdot[(IProp->HGPhase + numPhase)] += GR * data->size[IProp->HGSize - 1]; 
+  sumNdot[(IProp->HGPhase + numPhase)] += GR * data->size[IProp->HGSize - 1];
   /*Calculate the monomers consumed in heterogeneous nucleation*/
 
   for (int c = 0; c < numComp; c++)
@@ -591,7 +600,7 @@ static void printYVector(N_Vector y)
     string phaseStr;
     int_to_string(p, phaseStr, 10);
     profStr.append(phaseStr);
-    P_file.open(profStr.c_str());
+    P_file.open(dirPath.string() + "/" + profStr + ".txt");
     P_file << "cluster size (# atoms)\tcluster radius (m)\tcluster density (1/m3)" << endl;
     for (int i = 0; i < numClass; i++)
     {
