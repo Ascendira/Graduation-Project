@@ -16,7 +16,9 @@
 #include <sundials/sundials_math.h>  /* contains the macros ABS, SQR, and EXP */
 #include <sundials/sundials_types.h> /* definition of realtype */
 
-#include <sunlinsol/sunlinsol_spgmr.h>
+// 引入带状矩阵和带状线性求解器头文件
+#include <sunmatrix/sunmatrix_band.h> 
+#include <sunlinsol/sunlinsol_band.h>
 
 #include "Constants.h" /*Constants header file*/
 #include "Input.h"     /*Input parameter header file*/
@@ -110,14 +112,14 @@ int main()
   N_Vector y0 = N_VNew_Serial(neq_groups, sunctx);
   realtype *yd = NV_DATA_S(y0);
 
-  // 初始值填充 (极小值避免除0错误)
+  // 初始值填充 (交错排列: M0_0, M1_0, M0_1, M1_1, ...)
   for (int p = 0; p < numCalcPhase; p++)
   {
+    int p_base = p * numGroups * 2;
     for (int g = 0; g < numGroups; g++)
     {
-      int p_base = p * numGroups * 2;
-      yd[p_base + g] = 1E-30;
-      yd[p_base + numGroups + g] = 1E-30 * GMap[g].n_center;
+      yd[p_base + 2 * g] = 1E-30;                         // M0
+      yd[p_base + 2 * g + 1] = 1E-30 * GMap[g].n_center;  // M1
     }
   }
 
@@ -136,8 +138,8 @@ int main()
       solProd[p] *= pow(IMaterial->C0[c], IMaterial->X[p][c]);
     }
     int p_base = p * numGroups * 2;
-    yd[p_base] = solProd[p];             // 数量 M0_g0
-    yd[p_base + numGroups] = solProd[p]; // 原子总数 M1_g0 (因为单体 n=1)
+    yd[p_base] = solProd[p];         // 数量 M0_g0
+    yd[p_base + 1] = solProd[p];     // 原子总数 M1_g0 (因为单体 n=1)
   }
 
   // 3. 配置求解器和数据
@@ -152,17 +154,10 @@ int main()
   CVodeSStolerances(cvode_mem, RTOL, ATOL);
   CVodeSetMaxNumSteps(cvode_mem, mxsteps);
 
-  // 配置带状线性求解器 (分组后带状特性依然保持)
-  // SUNMatrix A = SUNBandMatrix(neq_groups, numGroups * 2, numGroups * 2, sunctx);
-  // SUNLinearSolver LS = SUNLinSol_Band(y0, A, sunctx);
-  // CVodeSetLinearSolver(cvode_mem, LS, A);
-
-  // 创建 SPGMR 线性求解器。参数 0 表示使用默认的 Krylov 子空间最大维度 (通常为 5)
-  // SUN_PREC_NONE 表示暂时不使用预条件器 (Preconditioner)
-  SUNLinearSolver LS = SUNLinSol_SPGMR(y0, SUN_PREC_NONE, 0, sunctx);
-
-  // 将迭代求解器附加到 CVODE 内存块中，注意这里不需要传入矩阵对象 (传 NULL)
-  CVodeSetLinearSolver(cvode_mem, LS, NULL);
+  // 配置带状线性求解器 (mu=3, ml=3 极窄带宽配置)
+  SUNMatrix A = SUNBandMatrix(neq_groups, 3, 3, sunctx);
+  SUNLinearSolver LS = SUNLinSol_Band(y0, A, sunctx);
+  CVodeSetLinearSolver(cvode_mem, LS, A);
 
   // 4. 打开主输出文件
   string dir = "../data/output";
@@ -189,8 +184,7 @@ int main()
   }
   O_file << "Mn\tNi\tSi" << endl;
 
-  realtype radM1_out[numCalcPhase], radM2_out[numCalcPhase],
-      rhoC_out[numCalcPhase];
+  realtype radM1_out[numCalcPhase], radM2_out[numCalcPhase], rhoC_out[numCalcPhase];
 
   // 5. 主循环计算
   for (int i = 0; i < runs; i++)
@@ -234,6 +228,7 @@ int main()
   delete IProp;
   CVodeFree(&cvode_mem);
   SUNLinSolFree(LS);
+  SUNMatDestroy(A); // 新增矩阵释放
   SUNContext_Free(&sunctx);
 
   return 0;
@@ -343,7 +338,6 @@ static int fluxIndex(int phase, int groupIdx)
 static void getGroupFlux(UserDataType *data, N_Vector y, realtype *J_M)
 {
   realtype *yd = NV_DATA_S(y);
-  int M1_off = numGroups;
   realtype solP[numCalcPhase], sumwp, wp, wpEff;
 
   realtype C_sol[numComp];
@@ -375,14 +369,15 @@ static void getGroupFlux(UserDataType *data, N_Vector y, realtype *J_M)
     sumwp = 0;
     for (int c = 0; c < numComp; c++)
     {
-      realtype wp = C_sol[c] * D[c] *
+      realtype wp_temp = C_sol[c] * D[c] *
                     ((4.0 * pi * r_b_0) / IMaterial->aVol);
-      sumwp += (nu[pref][c] / wp);
+      sumwp += (nu[pref][c] / wp_temp);
     }
     wpEff = 1.0 / sumwp;
 
+    // 修改：交错排列下获取 M0_0 和 M0_1
     realtype C_right_0 = yd[p_base] / numPhase;
-    realtype C_left_1 = yd[p_base + 1];
+    realtype C_left_1 = yd[p_base + 2]; // M0_1 的索引为 p_base + 2
 
     realtype delG_boundary_0 =
         exp(surfTerm[pref] * (pow(2.0, 2.0 / 3.0) - pow(1.0, 2.0 / 3.0)));
@@ -394,15 +389,15 @@ static void getGroupFlux(UserDataType *data, N_Vector y, realtype *J_M)
     realtype backward_flux_0 = wpEff * emission_ratio_0 * C_left_1;
 
     J_M[fluxIndex(p, 1)] = forward_flux_0 - backward_flux_0;
-    // fluxIndex indicates the flux form group i t group i+1
 
     for (int g = 2; g < numGroups; g++)
     {
-      realtype M0_gm1 = yd[p_base + g - 1];
-      realtype M1_gm1 = yd[p_base + g + M1_off - 1];
+      // 修改：交错排列下的 M0 和 M1 获取方式
+      realtype M0_gm1 = yd[p_base + 2 * (g - 1)];
+      realtype M1_gm1 = yd[p_base + 2 * (g - 1) + 1];
 
-      realtype M0_g = yd[p_base + g];
-      realtype M1_g = yd[p_base + g + M1_off];
+      realtype M0_g = yd[p_base + 2 * g];
+      realtype M1_g = yd[p_base + 2 * g + 1];
 
       // 1. 评估界面处的吸收速率 (wpEff) 和发射速率修正 (emission_ratio)
       realtype n_b = GMap[g - 1].n_max;
@@ -423,12 +418,10 @@ static void getGroupFlux(UserDataType *data, N_Vector y, realtype *J_M)
       {
         if (g < numDiscrete)
         {
-          // 【精确区】：浓度就是 M0 本身，不需要插值
           C_right_g = M0_gm1;
         }
         else
         {
-          // 【分组区】：使用差值法线性重构右边界浓度
           realtype n_avg_gm1 = getAvgN(M0_gm1, M1_gm1, g - 1);
           realtype delta_n_gm1 = n_avg_gm1 - GMap[g - 1].n_center;
           realtype slope_gm1 =
@@ -445,12 +438,10 @@ static void getGroupFlux(UserDataType *data, N_Vector y, realtype *J_M)
       {
         if (g < numDiscrete)
         {
-          // 下一组依然是精确区
           C_left_g = M0_g;
         }
         else
         {
-          // 下一组是分组区 (完美涵盖了交界处情况)
           realtype n_avg_g = getAvgN(M0_g, M1_g, g);
           realtype delta_n_g = n_avg_g - GMap[g].n_center;
           realtype slope_g = 12.0 * delta_n_g / (GMap[g].width * GMap[g].width);
@@ -489,21 +480,21 @@ static int f(realtype t, N_Vector y, N_Vector ydot, void *user_data)
   for (int p = 0; p < numCalcPhase; p++)
   {
     int pref = p % numPhase;
-    int M0_base = p * numGroups * 2;
-    int M1_base = M0_base + numGroups;
+    int p_base = p * numGroups * 2; // 交错排列基底索引
 
-    ydotd[M0_base] = -data->J_M[fluxIndex(p, 1)];
-    ydotd[M1_base] = -data->J_M[fluxIndex(p, 1)];
+    // 组 0
+    ydotd[p_base] = -data->J_M[fluxIndex(p, 1)];     // M0_0
+    ydotd[p_base + 1] = -data->J_M[fluxIndex(p, 1)]; // M1_0
 
     for (int g = 1; g < numGroups; g++)
     {
-
-      ydotd[M0_base + g] = data->J_M[fluxIndex(p, g)] - data->J_M[fluxIndex(p, g + 1)];
-      ydotd[M1_base + g] = data->J_M[fluxIndex(p, g)] * GMap[g].n_min - data->J_M[fluxIndex(p, g + 1)] * GMap[g].n_max;
+      // 修改：交错排布赋值
+      ydotd[p_base + 2 * g] = data->J_M[fluxIndex(p, g)] - data->J_M[fluxIndex(p, g + 1)];
+      ydotd[p_base + 2 * g + 1] = data->J_M[fluxIndex(p, g)] * GMap[g].n_min - data->J_M[fluxIndex(p, g + 1)] * GMap[g].n_max;
 
       for (int c = 0; c < numComp; c++)
       {
-        total_sol_cons[c] += IMaterial->X[pref][c] * ydotd[M1_base + g];
+        total_sol_cons[c] += IMaterial->X[pref][c] * ydotd[p_base + 2 * g + 1];
       }
     }
   }
@@ -518,12 +509,11 @@ static int f(realtype t, N_Vector y, N_Vector ydot, void *user_data)
 
   int g_hg = cluNumTGroupIndex(IProp->HGSize);
   int p_hg = IProp->HGPhase + numPhase;
+  int hg_base = p_hg * numGroups * 2;
 
-  ydotd[p_hg * numGroups * 2 + g_hg] += GR;
-  ydotd[p_hg * numGroups * 2 + numGroups + g_hg] += IProp->HGSize * GR;
-
-  realtype ydotdM0_g = ydotd[p_hg * numGroups * 2 + g_hg];
-  realtype ydotdM1_g = ydotd[p_hg * numGroups * 2 + numGroups + g_hg];
+  // 修改：非均相形核的生成项交错排布索引
+  ydotd[hg_base + 2 * g_hg] += GR;
+  ydotd[hg_base + 2 * g_hg + 1] += IProp->HGSize * GR;
 
   for (int c = 0; c < numComp; c++)
   {
@@ -546,7 +536,6 @@ static void getOutput(N_Vector y, realtype radM1[numCalcPhase],
                       realtype rhoC[numCalcPhase])
 {
   realtype *yd = NV_DATA_S(y);
-  int M1_off = numGroups;
 
   for (int p = 0; p < numCalcPhase; p++)
   {
@@ -564,13 +553,14 @@ static void getOutput(N_Vector y, realtype radM1[numCalcPhase],
         continue;
       else if (std::ceil(GMap[g].n_min) < CutoffSize)
       {
-        M0 = yd[p_base + g] * ((std::floor(GMap[g].n_min) - CutoffSize + 1.0));
-        M1 = yd[p_base + g + M1_off] * ((std::floor(GMap[g].n_min) - CutoffSize + 1.0));
+        // 修改：交错获取 M0, M1
+        M0 = yd[p_base + 2 * g] * ((std::floor(GMap[g].n_min) - CutoffSize + 1.0));
+        M1 = yd[p_base + 2 * g + 1] * ((std::floor(GMap[g].n_min) - CutoffSize + 1.0));
       }
       else
       {
-        M0 = yd[p_base + g] * GMap[g].width;
-        M1 = yd[p_base + g + M1_off] * GMap[g].width;
+        M0 = yd[p_base + 2 * g] * GMap[g].width;
+        M1 = yd[p_base + 2 * g + 1] * GMap[g].width;
       }
 
       if (M0 < 1e-35)
@@ -605,7 +595,6 @@ static void getOutput(N_Vector y, realtype radM1[numCalcPhase],
 static void printYVector(N_Vector y, int runIdx)
 {
   realtype *yd = NV_DATA_S(y);
-  int M1_off = numGroups;
 
   for (int p = 0; p < numCalcPhase; p++)
   {
@@ -627,8 +616,9 @@ static void printYVector(N_Vector y, int runIdx)
     int p_base = p * numGroups * 2;
     for (int g = 0; g < numGroups; g++)
     {
-      realtype M0 = yd[p_base + g] * GMap[g].width;
-      realtype M1 = yd[p_base + g + M1_off] * GMap[g].width;
+      // 修改：交错获取 M0, M1
+      realtype M0 = yd[p_base + 2 * g] * GMap[g].width;
+      realtype M1 = yd[p_base + 2 * g + 1] * GMap[g].width;
 
       realtype n_avg = (M0 > 1e-35) ? (M1 / M0) : GMap[g].n_center;
       realtype r_avg = pow(3.0 * IMaterial->cVol[pref] * n_avg / (4.0 * pi), 1.0 / 3.0);
