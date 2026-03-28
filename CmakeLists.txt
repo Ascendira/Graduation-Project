@@ -24,7 +24,6 @@ target_link_libraries(MNS_Model
     PRIVATE
     SUNDIALS::cvode_static 
     SUNDIALS::nvecserial_static
-    SUNDIALS::sunmatrixband_static
     SUNDIALS::sunlinsolband_static
     SUNDIALS::core_static
     m
