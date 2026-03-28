@@ -559,11 +559,19 @@ static void getOutput(N_Vector y, realtype radM1[numCalcPhase],
 
     for (int g = 0; g < numGroups; g++)
     {
-      if (GMap[g].n_max < CutoffSize)
+      realtype M0, M1;
+      if (std::floor(GMap[g].n_max) < CutoffSize)
         continue;
-
-      realtype M0 = yd[p_base + g];
-      realtype M1 = yd[p_base + g + M1_off];
+      else if (std::ceil(GMap[g].n_min) < CutoffSize)
+      {
+        M0 = yd[p_base + g] * ((std::floor(GMap[g].n_min) - CutoffSize + 1.0));
+        M1 = yd[p_base + g + M1_off] * ((std::floor(GMap[g].n_min) - CutoffSize + 1.0));
+      }
+      else
+      {
+        M0 = yd[p_base + g] * GMap[g].width;
+        M1 = yd[p_base + g + M1_off] * GMap[g].width;
+      }
 
       if (M0 < 1e-35)
         continue;
@@ -619,8 +627,8 @@ static void printYVector(N_Vector y, int runIdx)
     int p_base = p * numGroups * 2;
     for (int g = 0; g < numGroups; g++)
     {
-      realtype M0 = yd[p_base + g];
-      realtype M1 = yd[p_base + g + M1_off];
+      realtype M0 = yd[p_base + g] * GMap[g].width;
+      realtype M1 = yd[p_base + g + M1_off] * GMap[g].width;
 
       realtype n_avg = (M0 > 1e-35) ? (M1 / M0) : GMap[g].n_center;
       realtype r_avg = pow(3.0 * IMaterial->cVol[pref] * n_avg / (4.0 * pi), 1.0 / 3.0);
