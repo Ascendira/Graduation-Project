@@ -38,10 +38,10 @@ struct GroupMap
   radM2         // Method to calculate mean radius of precipitate, radM1 or radM2
 #define T0 ZERO // Initial time
 
-#define numCalcPhase (numPhase * 2)                 // number of calculating phases,including both home and heter nucleated phases
+#define numCalcPhase (numPhase * 2) // number of calculating phases,including both home and heter nucleated phases
 #define neq_groups (numCalcPhase * numGroups * 2 + numComp)
 
-#define RTOL RCONST(1.0E-6) // rel tolerance
-#define ATOL RCONST(ZERO)   // abs tolerance
+#define RTOL RCONST(1.0E-6)  // rel tolerance
+#define ATOL RCONST(1.0E-30) // abs tolerance (non-zero to avoid over-solving tiny states)
 
 #endif
