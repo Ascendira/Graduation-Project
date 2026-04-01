@@ -639,9 +639,9 @@ static int f(realtype t, N_Vector y, N_Vector ydot, void *user_data)
     for (int g = 1; g < numGroups; g++)
     {
       // 交错排布赋值
-      ydotd[p_base + 2 * g] = data->J_M[fluxIndex(p, g)] - data->J_M[fluxIndex(p, g + 1)];
       ydotd[p_base + 2 * g + 1] = data->J_M[fluxIndex(p, g)] * GMap[g].n_min - data->J_M[fluxIndex(p, g + 1)] * GMap[g].n_max;
-
+      ydotd[p_base + 2 * g] = ydotd[p_base + 2 * g + 1] / GMap[g].n_center;
+      
       for (int c = 0; c < numComp; c++)
       {
         total_sol_cons[c] += IMaterial->X[pref][c] * ydotd[p_base + 2 * g + 1];
