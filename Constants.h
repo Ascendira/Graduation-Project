@@ -29,8 +29,12 @@ struct GroupMap
 #define kb RCONST(8.617E-5) // Boltzmann
 #define pi RCONST(3.141592) // pi
 
-#define numPhase 2     // Number of precipitating phases
-#define numComp 3      // Number of precipitating components
+// phase:
+// 0, 1, 2：均相形核 (T3, T6, Cu)
+// 3, 4, 5：异质形核 (T3, T6, Cu)
+
+#define numPhase 3     // Number of precipitating phases
+#define numComp 4      // Number of precipitating components
 #define numClass 50000 // Number of cluster classes/maximum cluster size considered
 #define runs 50        // Number of loops to run
 #define CutoffSize 65  // Cutoff size used for output
