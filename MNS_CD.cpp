@@ -81,7 +81,7 @@ static void getDelG(realtype *size, realtype **radClust, realtype **delG);
 static void getInitVals(realtype y0[neq]);
 static void initParams();
 static void GetRED(realtype D[numComp], realtype Flux);
-static void printYVector(N_Vector y);
+static void printYVector(N_Vector y, int runIdx);
 static void getOutput(N_Vector y, realtype radM1[numCalcPhase],
                       realtype radM2[numCalcPhase],
                       realtype rhoC[numCalcPhase]);
@@ -98,6 +98,8 @@ realtype rhoC[numCalcPhase], radM1[numCalcPhase], radM2[numCalcPhase];
 
 realtype Flux, solProd[numPhase];
 /*Irradiation flux, solute product */
+
+static string gOutputDir = "../data/output/original";
 
 filesystem::path dirPath("../data/output/original");
 
@@ -195,7 +197,7 @@ int main()
     }
     O_file << yd[neq - 3] << "\t" << yd[neq - 2] << "\t" << yd[neq - 1] << endl;
 
-    printYVector(y0);
+    printYVector(y0, i);
 
     SUNLinSolFree(LS);
     SUNMatDestroy(A);
@@ -586,21 +588,25 @@ This function prints cluster size distribution in the file Profile for the final
 solution time.
 
 ***********************************************************************************************/
-static void printYVector(N_Vector y)
+static void printYVector(N_Vector y, int runIdx)
 {
-  realtype *yd;
-  ofstream P_file;
-  yd = NV_DATA_S(y);
-  int pref;
+  realtype *yd = NV_DATA_S(y);
 
   for (int p = 0; p < numCalcPhase; p++)
   {
-    pref = p % numPhase;
-    string profStr = "Profile_";
-    string phaseStr;
-    int_to_string(p, phaseStr, 10);
-    profStr.append(phaseStr);
-    P_file.open(dirPath.string() + "/" + profStr + ".txt");
+    int pref = p % numPhase;
+    string dir = gOutputDir + "/Phase_" + to_string(p);
+    std::filesystem::path dirPath(dir);
+    if (!std::filesystem::exists(dirPath))
+    {
+      if (!std::filesystem::create_directories(dirPath))
+        return;
+    }
+    string profStr = dir + "/Run" + to_string(runIdx) + ".txt";
+
+    ofstream P_file(profStr.c_str());
+    if (!P_file.is_open())
+      return;
     P_file << "cluster size (# atoms)\tcluster radius (m)\tcluster density (1/m3)" << endl;
     for (int i = 0; i < numClass; i++)
     {
@@ -613,7 +619,6 @@ static void printYVector(N_Vector y)
     }
     P_file.close();
   }
-  return;
 }
 
 void int_to_string(int i, string &a, int base)
