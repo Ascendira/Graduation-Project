@@ -11,8 +11,8 @@ typedef sunrealtype realtype;
 
 // 二元分组法
 #define numDiscrete 100     // 前100个集群保持离散（每组1个）
-#define numGroups 500       // 总分组数（包含离散和分组部分）
-#define groupingFactor 1.02 // 分组宽度增长因子
+#define numGroups 5000       // 总分组数（包含离散和分组部分）
+#define groupingFactor 1.002 // 分组宽度增长因子
 
 struct GroupMap
 {

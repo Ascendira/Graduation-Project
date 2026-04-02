@@ -430,6 +430,11 @@ static void getGroupFlux(UserDataType *data, N_Vector y, realtype *J_M)
   realtype C_sol[numComp];
   for (int c = 0; c < numComp; c++)
   {
+    if (yd[neq_groups - numComp + c] < 1E-30)
+    {
+      logStream() << "Warning: Negative solute concentration for component " << c
+                  << ": " << yd[neq_groups - numComp + c] << ". Resetting to 1e-30." << endl;
+    }
     C_sol[c] = std::max(1e-30, yd[neq_groups - numComp + c]);
   }
 
@@ -507,7 +512,7 @@ static void getGroupFlux(UserDataType *data, N_Vector y, realtype *J_M)
       realtype M1_g = yd[p_base + 2 * g + 1];
 
       // 1. 评估界面处的吸收速率 (wpEff) 和发射速率修正 (emission_ratio)
-      realtype n_b = GMap[g - 1].n_max;
+      realtype n_b = GMap[g - 1].n_center;
       realtype r_b =
           pow(3.0 * IMaterial->cVol[pref] * n_b / (4.0 * pi), 1.0 / 3.0);
 
@@ -640,11 +645,11 @@ static int f(realtype t, N_Vector y, N_Vector ydot, void *user_data)
     {
       // 交错排布赋值
       ydotd[p_base + 2 * g] = data->J_M[fluxIndex(p, g)] - data->J_M[fluxIndex(p, g + 1)];
-      ydotd[p_base + 2 * g + 1] = data->J_M[fluxIndex(p, g)] * GMap[g].n_min - data->J_M[fluxIndex(p, g + 1)] * GMap[g].n_max;
-      
+      ydotd[p_base + 2 * g + 1] = ydotd[p_base + 2 * g] * GMap[g].n_center;
+
       for (int c = 0; c < numComp; c++)
       {
-        total_sol_cons[c] += IMaterial->X[pref][c] * ydotd[p_base + 2 * g + 1];
+        total_sol_cons[c] += IMaterial->X[pref][c] * ydotd[p_base + 2 * g + 1] * GMap[g].width;
       }
     }
   }
