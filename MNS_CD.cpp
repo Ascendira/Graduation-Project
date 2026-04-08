@@ -316,7 +316,6 @@ static void initParams()
     surfTerm[p] = 4.0 * pi * IMaterial->sig[p] *
                   pow((3.0 * IMaterial->cVol[p]) / (4.0 * pi), 2.0 / 3.0) /
                   (kb * ICond->Temp);
-    realtype a = surfTerm[p];
     for (int c = 0; c < numComp; c++)
     {
       nu[p][c] = pow(IMaterial->X[p][c], 2);
@@ -438,6 +437,499 @@ static int cluNumTGroupIndex(realtype n)
 static int fluxIndex(int phase, int groupIdx)
 {
   return phase * (numGroups + 1) + groupIdx;
+}
+
+static void getGroupFlux(UserDataType *data, N_Vector y, realtype *J_M)
+{
+  realtype *yd = NV_DATA_S(y);
+  realtype solP[numCalcPhase], sumwp, wp, wpEff;
+
+  for (int p = 0; p < numPhase; p++)
+  {
+    solP[p] = 1.0;
+    for (int c = 0; c < numComp; c++)
+    {
+      solP[p] *= pow(yd[neq_groups - numComp + c], IMaterial->X[p][c]);
+    }
+
+    if (solP[p] < data->min_solP_seen)
+      data->min_solP_seen = solP[p];
+    if (solP[p] <= ZERO)
+      data->non_positive_solP_count++;
+    if (!std::isfinite(solP[p]))
+      data->non_finite_count++;
+  }
+  for (int p = numPhase; p < numCalcPhase; p++)
+    solP[p] = 1E-30;
+
+  for (int p = 0; p < numCalcPhase; p++)
+  {
+    int pref = p % numPhase;
+    int p_base = p * numGroups * 2;
+
+    J_M[fluxIndex(p, 0)] = ZERO;
+
+    realtype r_b_0 =
+        pow(3.0 * IMaterial->cVol[pref] * 1.0 / (4.0 * pi), 1.0 / 3.0);
+    sumwp = 0;
+    for (int c = 0; c < numComp; c++)
+    {
+      realtype wp_temp = yd[neq_groups - numComp + c] * D[c] *
+                         ((4.0 * pi * r_b_0) / IMaterial->aVol);
+      sumwp += (nu[pref][c] / wp_temp);
+    }
+    wpEff = 1.0 / sumwp;
+    if (wpEff < data->min_wpEff_seen)
+      data->min_wpEff_seen = wpEff;
+    if (!std::isfinite(wpEff) || !std::isfinite(sumwp))
+      data->non_finite_count++;
+
+    // 交错排列下获取 M0_0 和 M0_1
+    realtype C_right_0 = yd[p_base] / numPhase;
+    realtype C_left_1 = yd[p_base + 2]; // M0_1 的索引为 p_base + 2
+
+    realtype dG_surf_0 = surfTerm[pref] * (pow(2.0, 2.0 / 3.0) - pow(1.0, 2.0 / 3.0));
+
+    realtype dG_disl_0 = get_delG_disl(p, 2.0, pref) - get_delG_disl(p, 1.0, pref);
+    realtype dG_disl_kT_0 = dG_disl_0 / (kb * ICond->Temp);
+
+    realtype emission_ratio_0 = (IMaterial->solPBar[pref] / solP[pref]) * exp(dG_surf_0 + dG_disl_kT_0);
+    if (emission_ratio_0 > data->max_emission_ratio_seen)
+      data->max_emission_ratio_seen = emission_ratio_0;
+    if (!std::isfinite(emission_ratio_0))
+      data->non_finite_count++;
+
+    realtype forward_flux_0 = wpEff * C_right_0;
+    realtype backward_flux_0 = wpEff * emission_ratio_0 * C_left_1;
+
+    J_M[fluxIndex(p, 1)] = forward_flux_0 - backward_flux_0;
+    realtype abs_flux_0 = abs(J_M[fluxIndex(p, 1)]);
+    if (abs_flux_0 > data->max_abs_flux_seen)
+      data->max_abs_flux_seen = abs_flux_0;
+    if (!std::isfinite(J_M[fluxIndex(p, 1)]))
+      data->non_finite_count++;
+
+    for (int g = 2; g < numGroups; g++)
+    {
+      // 交错排列下的 M0 和 M1 获取方式
+      realtype M0_gm1 = yd[p_base + 2 * (g - 1)];
+      realtype M1_gm1 = yd[p_base + 2 * (g - 1) + 1];
+
+      realtype M0_g = yd[p_base + 2 * g];
+      realtype M1_g = yd[p_base + 2 * g + 1];
+
+      // 1. 评估界面处的吸收速率 (wpEff) 和发射速率修正 (emission_ratio)
+      realtype n_b = GMap[g - 1].n_center;
+      realtype r_b =
+          pow(3.0 * IMaterial->cVol[pref] * n_b / (4.0 * pi), 1.0 / 3.0);
+
+      sumwp = 0;
+      for (int c = 0; c < numComp; c++)
+      {
+        wp = yd[neq_groups - numComp + c] * D[c] * ((4.0 * pi * r_b) / IMaterial->aVol);
+        sumwp += (nu[pref][c] / wp);
+      }
+      wpEff = 1.0 / sumwp;
+      if (wpEff < data->min_wpEff_seen)
+        data->min_wpEff_seen = wpEff;
+      if (!std::isfinite(wpEff) || !std::isfinite(sumwp))
+        data->non_finite_count++;
+
+      // 2. 评估界面左侧浓度 (C_right_g) -> 驱动向右的生长通量
+      realtype C_right_g = 1e-30;
+      if (M0_gm1 > 1e-35)
+      {
+        if (g < numDiscrete)
+        {
+          C_right_g = M0_gm1;
+        }
+        else
+        {
+          realtype n_avg_gm1 = getAvgN(M0_gm1, M1_gm1, g - 1);
+          realtype delta_n_gm1 = n_avg_gm1 - GMap[g - 1].n_center;
+          realtype slope_gm1 =
+              12.0 * delta_n_gm1 / (GMap[g - 1].width * GMap[g - 1].width);
+          C_right_g = M0_gm1 * (1.0 + slope_gm1 * (GMap[g - 1].n_max - GMap[g - 1].n_center));
+        }
+      }
+
+      // 3. 评估界面右侧浓度 (C_left_gp1) -> 驱动向左的溶解通量
+      realtype C_left_g = 1e-30;
+      if (M0_g > 1e-35)
+      {
+        if (g < numDiscrete)
+        {
+          C_left_g = M0_g;
+        }
+        else
+        {
+          realtype n_avg_g = getAvgN(M0_g, M1_g, g);
+          realtype delta_n_g = n_avg_g - GMap[g].n_center;
+          realtype slope_g = 12.0 * delta_n_g / (GMap[g].width * GMap[g].width);
+          C_left_g = M0_g * (1.0 + slope_g * (GMap[g].n_min - GMap[g].n_center));
+        }
+      }
+
+      // 4. 界面能修正与通量计算 (完美迎风格式)
+      realtype current_surfTerm = surfTerm[pref];
+
+      // Cu 相 (pref == 2) 跨越 CutoCRP (20原子) 时的动态界面能
+      if (pref == 2 && n_b >= 20.0)
+      {
+        current_surfTerm = surfTerm[numPhase + 1];
+        // 使用预设的跨越 CutoCRP 后的界面能参数
+      }
+
+      // 1. 表面能带来的势垒差 (无量纲)
+      realtype dG_surf_g = current_surfTerm * (pow(n_b + 1.0, 2.0 / 3.0) - pow(n_b, 2.0 / 3.0));
+
+      // 2. 位错应变能释放带来的势垒差 (无量纲)
+      realtype dG_disl_g = get_delG_disl(p, n_b + 1.0, pref) - get_delG_disl(p, n_b, pref);
+      realtype dG_disl_kT_g = dG_disl_g / (kb * ICond->Temp);
+
+      // 3. 【统一合并】：物理意义为 exp([ΔG_surf + ΔG_disl] / kT)
+      realtype emission_ratio = (IMaterial->solPBar[pref] / solP[pref]) * exp(dG_surf_g + dG_disl_kT_g);
+
+      if (emission_ratio > data->max_emission_ratio_seen)
+        data->max_emission_ratio_seen = emission_ratio;
+      if (!std::isfinite(emission_ratio))
+        data->non_finite_count++;
+
+      realtype forward_flux = wpEff * C_right_g;
+      realtype backward_flux = wpEff * emission_ratio * C_left_g;
+
+      J_M[fluxIndex(p, g)] = forward_flux - backward_flux;
+      realtype abs_flux = abs(J_M[fluxIndex(p, g)]);
+      if (abs_flux > data->max_abs_flux_seen)
+        data->max_abs_flux_seen = abs_flux;
+      if (!std::isfinite(J_M[fluxIndex(p, g)]))
+        data->non_finite_count++;
+    }
+
+    J_M[fluxIndex(p, numGroups)] = ZERO;
+  }
+}
+
+static int f(realtype t, N_Vector y, N_Vector ydot, void *user_data)
+{
+  realtype *yd = NV_DATA_S(y);
+  realtype *ydotd = NV_DATA_S(ydot);
+  UserDataType *data = static_cast<UserDataType *>(user_data);
+
+  data->rhs_eval_counter++;
+  if (data->rhs_eval_counter % 500000 == 0)
+  {
+    realtype progress = ZERO;
+    if (data->current_target_t > ZERO)
+      progress = t / data->current_target_t;
+
+    long int nst_total = 0;
+    long int nli_total = 0;
+    if (data->cvode_mem != nullptr)
+    {
+      CVodeGetNumSteps(data->cvode_mem, &nst_total);
+      CVodeGetNumLinIters(data->cvode_mem, &nli_total);
+    }
+
+    logStream() << scientific << setprecision(6)
+                << "[diag-rhs] eval=" << data->rhs_eval_counter
+                << " t=" << t
+                << " minSolP=" << data->min_solP_seen
+                << " maxEmissionRatio=" << data->max_emission_ratio_seen
+                << " nonFinite=" << data->non_finite_count << endl;
+
+    logStream() << scientific << setprecision(6)
+                << "[diag-rhs-detail] run=" << data->current_run
+                << " target_t=" << data->current_target_t
+                << " progress=" << progress
+                << " totalSteps=" << nst_total
+                << " totalLinIters=" << nli_total << endl;
+  }
+
+  getGroupFlux(data, y, data->J_M);
+
+  realtype total_sol_cons[numComp] = {0.0, 0.0, 0.0};
+
+  for (int p = 0; p < numCalcPhase; p++)
+  {
+    int pref = p % numPhase;
+    int p_base = p * numGroups * 2; // 交错排列基底索引
+
+    ydotd[p_base] = -data->J_M[fluxIndex(p, 1)];     // M0_0
+    ydotd[p_base + 1] = -data->J_M[fluxIndex(p, 1)]; // M1_0
+
+    for (int g = 1; g < numGroups; g++)
+    {
+      ydotd[p_base + 2 * g] = data->J_M[fluxIndex(p, g)] - data->J_M[fluxIndex(p, g + 1)];
+      ydotd[p_base + 2 * g + 1] = ydotd[p_base + 2 * g] * GMap[g].n_center;
+
+      for (int c = 0; c < numComp; c++)
+      {
+        total_sol_cons[c] += IMaterial->X[pref][c] * ydotd[p_base + 2 * g + 1] * GMap[g].width;
+      }
+    }
+  }
+
+  // 在每个 run 的目标时刻附近导出一次分组数据并生成图像
+  // writeGroupPlotDataAndImages(data, t, ydotd);
+
+  // =========================================================================
+  // 【核心机制融合】：统一计算 MNS 相 (T3 和 T6) 的热力学驱动力与实际浓度积
+  // =========================================================================
+  realtype driving_force_MNS[numPhase - 1] = {0.0};
+  realtype solP_MNS[numPhase - 1] = {1.0, 1.0}; // 预存实际浓度积，避免重复使用 pow 计算
+  realtype total_df_MNS = 0.0;
+
+  for (int p_MNS = 0; p_MNS < numPhase - 1; p_MNS++)
+  {
+    for (int c = 0; c < numComp; c++)
+    {
+      realtype safe_C = std::max(1e-30, yd[neq_groups - numComp + c]);
+      solP_MNS[p_MNS] *= pow(safe_C, IMaterial->X[p_MNS][c]);
+    }
+    // 驱动力 = 实际溶度积 / 平衡溶度积。若小于 1 则说明未过饱和。
+    realtype df = solP_MNS[p_MNS] / IMaterial->solPBar[p_MNS];
+    driving_force_MNS[p_MNS] = (df > 1.0) ? (df - 1.0) : 0.0;
+    total_df_MNS += driving_force_MNS[p_MNS];
+  }
+
+  // =========================================================================
+  // 【回归原版设计的机制 1】：平行伴侣触发 (Cu 跨越 20 时，催化伴生一个 22 原子的 MNS)
+  // =========================================================================
+  int p_Cu = 2;
+  realtype CutoCRP = 20.0;
+  realtype MNS_to_Cu_ratio = 1.1;
+
+  int g_Cu_crit = cluNumTGroupIndex(CutoCRP);
+  realtype companion_mns_atoms = CutoCRP * MNS_to_Cu_ratio;
+  int g_MNS_seed = cluNumTGroupIndex(companion_mns_atoms);
+
+  // 获取 Cu 团簇跨越 20 的通量，用作“催化率”
+  realtype coupling_flux = data->J_M[fluxIndex(p_Cu, g_Cu_crit)];
+
+  if (coupling_flux > ZERO)
+  {
+    // 注意：绝对不要从 p_Cu 中减去 coupling_flux！
+    // Cu 团簇继续保留在 p_Cu 中作为 Core 演化。
+
+    if (total_df_MNS > ZERO)
+    {
+      for (int p_MNS = 0; p_MNS < numPhase - 1; p_MNS++)
+      {
+        realtype fraction = driving_force_MNS[p_MNS] / total_df_MNS;
+        if (fraction > 1e-6)
+        {
+          realtype phase_flux = coupling_flux * fraction;
+          int mns_base = p_MNS * numGroups * 2;
+
+          // 在 MNS 相中生成一个独立的“伴侣/外壳”团簇
+          ydotd[mns_base + 2 * g_MNS_seed] += phase_flux;
+          ydotd[mns_base + 2 * g_MNS_seed + 1] += phase_flux * companion_mns_atoms;
+
+          // 消耗基体的 Mn, Ni, Si 来形成这个伴侣
+          for (int c = 0; c < numComp; c++)
+          {
+            total_sol_cons[c] += phase_flux * companion_mns_atoms * IMaterial->X[p_MNS][c];
+          }
+        }
+      }
+    }
+    else
+    {
+      // Fallback: 驱动力不足时挂载给 T3
+      int p_fallback = 0;
+      int mns_base = p_fallback * numGroups * 2;
+
+      ydotd[mns_base + 2 * g_MNS_seed] += coupling_flux;
+      ydotd[mns_base + 2 * g_MNS_seed + 1] += coupling_flux * companion_mns_atoms;
+
+      for (int c = 0; c < numComp; c++)
+      {
+        total_sol_cons[c] += coupling_flux * companion_mns_atoms * IMaterial->X[p_fallback][c];
+      }
+    }
+  }
+
+  // =========================================================================
+  // 【机制 2】：MNS 相的级联直接形核
+  // =========================================================================
+  realtype GR = IProp->Alpha * Flux * IProp->ccs * solP_MNS[IProp->HGPhase] / IProp->RsolP;
+
+  int g_hg = cluNumTGroupIndex(IProp->HGSize);
+  int p_hg = IProp->HGPhase + numPhase;
+  int hg_base = p_hg * numGroups * 2;
+
+  // 非均相形核的生成项交错排布索引
+  ydotd[hg_base + 2 * g_hg] += GR;
+  ydotd[hg_base + 2 * g_hg + 1] += GR * GMap[g_hg].n_center;
+
+  for (int c = 0; c < numComp; c++)
+  {
+    total_sol_cons[c] += IMaterial->X[IProp->HGPhase][c] * (IProp->HGSize * GR);
+  }
+
+  // =========================================================================
+  // 【机制 3】：纯 Cu 相的级联形核 (独立计算)
+  // =========================================================================
+  int HGPhase_Cu = 2;       // 纯 Cu 相的 pref 索引
+  int HGSize_Cu = 16;       // 文献中 n_Cu-het = 16 atoms
+  realtype Alpha_Cu = 0.03; // 文献中 alpha_Cu = 0.03
+
+  realtype solP_Cu = 1.0;
+  for (int c = 0; c < numComp; c++)
+  {
+    realtype safe_C = std::max(1e-30, yd[neq_groups - numComp + c]);
+    solP_Cu *= pow(safe_C, IMaterial->X[HGPhase_Cu][c]);
+  }
+
+  // 按照驱动力比例缩放生成率
+  realtype GR_Cu = Alpha_Cu * Flux * IProp->ccs * solP_Cu / IMaterial->solPBar[HGPhase_Cu];
+
+  int g_hg_Cu = cluNumTGroupIndex(HGSize_Cu);
+  int p_hg_Cu = HGPhase_Cu + numPhase;
+  int hg_base_Cu = p_hg_Cu * numGroups * 2;
+
+  ydotd[hg_base_Cu + 2 * g_hg_Cu] += GR_Cu;
+  ydotd[hg_base_Cu + 2 * g_hg_Cu + 1] += HGSize_Cu * GR_Cu;
+
+  for (int c = 0; c < numComp; c++)
+  {
+    total_sol_cons[c] += IMaterial->X[HGPhase_Cu][c] * (HGSize_Cu * GR_Cu);
+  }
+
+  for (int c = 0; c < numComp; c++)
+  {
+    ydotd[neq_groups - numComp + c] = -total_sol_cons[c];
+  }
+
+  return 0;
+}
+
+/* =========================================================================
+ * 输出与格式化函数
+ * ========================================================================= */
+static void getOutput(N_Vector y, realtype radM1[numCalcPhase],
+                      realtype radM2[numCalcPhase],
+                      realtype rhoC[numCalcPhase])
+{
+  realtype *yd = NV_DATA_S(y);
+
+  for (int p = 0; p < numCalcPhase; p++)
+  {
+    int pref = p % numPhase;
+    int p_base = p * numGroups * 2;
+
+    realtype total_M0 = 0.0;
+    realtype sum_Ri_M0 = 0.0;
+    realtype total_M1 = 0.0;
+
+    for (int g = 0; g < numGroups; g++)
+    {
+      realtype M0, M1;
+      if (std::floor(GMap[g].n_max) < CutoffSize)
+        continue;
+      else if (std::ceil(GMap[g].n_min) < CutoffSize)
+      {
+        // 交错获取 M0, M1
+        M0 = yd[p_base + 2 * g] * ((std::floor(GMap[g].n_min) - CutoffSize + 1.0));
+        M1 = yd[p_base + 2 * g + 1] * ((std::floor(GMap[g].n_min) - CutoffSize + 1.0));
+      }
+      else
+      {
+        M0 = yd[p_base + 2 * g] * GMap[g].width;
+        M1 = yd[p_base + 2 * g + 1] * GMap[g].width;
+      }
+
+      if (M0 < 1e-35)
+        continue;
+
+      realtype n_avg = M1 / M0;
+      realtype r_avg =
+          pow(3.0 * IMaterial->cVol[pref] * n_avg / (4.0 * pi), 1.0 / 3.0);
+
+      total_M0 += M0;
+      sum_Ri_M0 += r_avg * M0;
+      total_M1 += M1;
+    }
+
+    if (total_M0 > 1e-35)
+    {
+      radM1[p] = sum_Ri_M0 / total_M0;
+      realtype n_mean = total_M1 / total_M0;
+      radM2[p] =
+          pow((n_mean * IMaterial->cVol[pref]) / ((4.0 / 3.0) * pi), 1.0 / 3.0);
+      rhoC[p] = total_M0 / IMaterial->aVol;
+    }
+    else
+    {
+      radM1[p] = 0.0;
+      radM2[p] = 0.0;
+      rhoC[p] = 0.0;
+    }
+  }
+}
+
+static void printYVector(N_Vector y, int runIdx)
+{
+  realtype *yd = NV_DATA_S(y);
+
+  for (int p = 0; p < numCalcPhase; p++)
+  {
+    string dir = gOutputDir + "/Phase_" + to_string(p);
+    std::filesystem::path dirPath(dir);
+    if (!std::filesystem::exists(dirPath))
+    {
+      if (!std::filesystem::create_directories(dirPath))
+        return;
+    }
+    string profStr = dir + "/Run" + to_string(runIdx) + ".txt";
+    std::filesystem::path profilePath(profStr);
+
+    ofstream P_file(profilePath.string(), ios::out | ios::trunc);
+    if (!P_file.is_open())
+      return;
+    P_file << "n_min\tn_max\tn_avg\tradius(m)\tdensity(1/m3)" << endl;
+
+    int pref = p % numPhase;
+    int p_base = p * numGroups * 2;
+    for (int g = 0; g < numGroups; g++)
+    {
+      // 交错获取 M0, M1
+      realtype M0 = yd[p_base + 2 * g] * GMap[g].width;
+      realtype M1 = yd[p_base + 2 * g + 1] * GMap[g].width;
+
+      realtype n_avg = (M0 > 1e-35) ? (M1 / M0) : GMap[g].n_center;
+      realtype r_avg = pow(3.0 * IMaterial->cVol[pref] * n_avg / (4.0 * pi), 1.0 / 3.0);
+
+      P_file << GMap[g].n_min << "\t" << GMap[g].n_max << "\t" << n_avg << "\t"
+             << r_avg << "\t" << (M0 / GMap[g].width) / IMaterial->aVol << endl;
+    }
+    P_file.close();
+
+    // plotPhaseProfile(profilePath, p, runIdx);
+  }
+}
+
+void int_to_string(int i, string &a, int base)
+{
+  int ii = i;
+  string aa;
+  int remain = ii % base;
+  if (ii == 0)
+  {
+    a.push_back(ii + 48);
+    return;
+  }
+  while (ii > 0)
+  {
+    aa.push_back(ii % base + 48);
+    ii = (ii - remain) / base;
+    remain = ii % base;
+  }
+  for (int j = aa.size() - 1; j >= 0; j--)
+  {
+    a.push_back(aa[j]);
+  }
 }
 
 static bool ensureGroupPlotScript(const std::filesystem::path &scriptPath)
@@ -780,508 +1272,5 @@ static void writeGroupPlotDataAndImages(UserDataType *data, realtype t,
   {
     logStream() << "Plot script failed for run " << data->current_run
                 << ". CSV files kept: " << lineCsv << " and " << barCsv << endl;
-  }
-}
-
-static void getGroupFlux(UserDataType *data, N_Vector y, realtype *J_M)
-{
-  realtype *yd = NV_DATA_S(y);
-  realtype solP[numCalcPhase], sumwp, wp, wpEff;
-
-  for (int p = 0; p < numPhase; p++)
-  {
-    solP[p] = 1.0;
-    for (int c = 0; c < numComp; c++)
-    {
-      solP[p] *= pow(yd[neq_groups - numComp + c], IMaterial->X[p][c]);
-    }
-
-    if (solP[p] < data->min_solP_seen)
-      data->min_solP_seen = solP[p];
-    if (solP[p] <= ZERO)
-      data->non_positive_solP_count++;
-    if (!std::isfinite(solP[p]))
-      data->non_finite_count++;
-  }
-  for (int p = numPhase; p < numCalcPhase; p++)
-    solP[p] = 1E-30;
-
-  for (int p = 0; p < numCalcPhase; p++)
-  {
-    int pref = p % numPhase;
-    int p_base = p * numGroups * 2;
-
-    J_M[fluxIndex(p, 0)] = ZERO;
-
-    realtype r_b_0 =
-        pow(3.0 * IMaterial->cVol[pref] * 1.0 / (4.0 * pi), 1.0 / 3.0);
-    sumwp = 0;
-    for (int c = 0; c < numComp; c++)
-    {
-      realtype wp_temp = yd[neq_groups - numComp + c] * D[c] *
-                         ((4.0 * pi * r_b_0) / IMaterial->aVol);
-      sumwp += (nu[pref][c] / wp_temp);
-    }
-    wpEff = 1.0 / sumwp;
-    if (wpEff < data->min_wpEff_seen)
-      data->min_wpEff_seen = wpEff;
-    if (!std::isfinite(wpEff) || !std::isfinite(sumwp))
-      data->non_finite_count++;
-
-    // 交错排列下获取 M0_0 和 M0_1
-    realtype C_right_0 = yd[p_base] / numPhase;
-    realtype C_left_1 = yd[p_base + 2]; // M0_1 的索引为 p_base + 2
-
-    realtype dG_surf_0 = surfTerm[pref] * (pow(2.0, 2.0 / 3.0) - pow(1.0, 2.0 / 3.0));
-
-    realtype dG_disl_0 = get_delG_disl(p, 2.0, pref) - get_delG_disl(p, 1.0, pref);
-    realtype dG_disl_kT_0 = dG_disl_0 / (kb * ICond->Temp);
-
-    realtype emission_ratio_0 = (IMaterial->solPBar[pref] / solP[pref]) * exp(dG_surf_0 + dG_disl_kT_0);
-    if (emission_ratio_0 > data->max_emission_ratio_seen)
-      data->max_emission_ratio_seen = emission_ratio_0;
-    if (!std::isfinite(emission_ratio_0))
-      data->non_finite_count++;
-
-    realtype forward_flux_0 = wpEff * C_right_0;
-    realtype backward_flux_0 = wpEff * emission_ratio_0 * C_left_1;
-
-    J_M[fluxIndex(p, 1)] = forward_flux_0 - backward_flux_0;
-    realtype abs_flux_0 = abs(J_M[fluxIndex(p, 1)]);
-    if (abs_flux_0 > data->max_abs_flux_seen)
-      data->max_abs_flux_seen = abs_flux_0;
-    if (!std::isfinite(J_M[fluxIndex(p, 1)]))
-      data->non_finite_count++;
-
-    for (int g = 2; g < numGroups; g++)
-    {
-      // 交错排列下的 M0 和 M1 获取方式
-      realtype M0_gm1 = yd[p_base + 2 * (g - 1)];
-      realtype M1_gm1 = yd[p_base + 2 * (g - 1) + 1];
-
-      realtype M0_g = yd[p_base + 2 * g];
-      realtype M1_g = yd[p_base + 2 * g + 1];
-
-      // 1. 评估界面处的吸收速率 (wpEff) 和发射速率修正 (emission_ratio)
-      realtype n_b = GMap[g - 1].n_center;
-      realtype r_b =
-          pow(3.0 * IMaterial->cVol[pref] * n_b / (4.0 * pi), 1.0 / 3.0);
-
-      sumwp = 0;
-      for (int c = 0; c < numComp; c++)
-      {
-        wp = yd[neq_groups - numComp + c] * D[c] * ((4.0 * pi * r_b) / IMaterial->aVol);
-        sumwp += (nu[pref][c] / wp);
-      }
-      wpEff = 1.0 / sumwp;
-      if (wpEff < data->min_wpEff_seen)
-        data->min_wpEff_seen = wpEff;
-      if (!std::isfinite(wpEff) || !std::isfinite(sumwp))
-        data->non_finite_count++;
-
-      // 2. 评估界面左侧浓度 (C_right_g) -> 驱动向右的生长通量
-      realtype C_right_g = 1e-30;
-      if (M0_gm1 > 1e-35)
-      {
-        if (g < numDiscrete)
-        {
-          C_right_g = M0_gm1;
-        }
-        else
-        {
-          realtype n_avg_gm1 = getAvgN(M0_gm1, M1_gm1, g - 1);
-          realtype delta_n_gm1 = n_avg_gm1 - GMap[g - 1].n_center;
-          realtype slope_gm1 =
-              12.0 * delta_n_gm1 / (GMap[g - 1].width * GMap[g - 1].width);
-          C_right_g = M0_gm1 * (1.0 + slope_gm1 * (GMap[g - 1].n_max - GMap[g - 1].n_center));
-        }
-      }
-
-      // 3. 评估界面右侧浓度 (C_left_gp1) -> 驱动向左的溶解通量
-      realtype C_left_g = 1e-30;
-      if (M0_g > 1e-35)
-      {
-        if (g < numDiscrete)
-        {
-          C_left_g = M0_g;
-        }
-        else
-        {
-          realtype n_avg_g = getAvgN(M0_g, M1_g, g);
-          realtype delta_n_g = n_avg_g - GMap[g].n_center;
-          realtype slope_g = 12.0 * delta_n_g / (GMap[g].width * GMap[g].width);
-          C_left_g = M0_g * (1.0 + slope_g * (GMap[g].n_min - GMap[g].n_center));
-        }
-      }
-
-      // 4. 界面能修正与通量计算 (完美迎风格式)
-      realtype current_surfTerm = surfTerm[pref];
-
-      // Cu 相 (pref == 2) 跨越 CutoCRP (20原子) 时的动态界面能
-      if (pref == 2 && n_b >= 20.0)
-      {
-        current_surfTerm = surfTerm[numPhase + 1];
-        // 使用预设的跨越 CutoCRP 后的界面能参数
-      }
-
-      // 1. 表面能带来的势垒差 (无量纲)
-      realtype dG_surf_g = current_surfTerm * (pow(n_b + 1.0, 2.0 / 3.0) - pow(n_b, 2.0 / 3.0));
-
-      // 2. 位错应变能释放带来的势垒差 (无量纲)
-      realtype dG_disl_g = get_delG_disl(p, n_b + 1.0, pref) - get_delG_disl(p, n_b, pref);
-      realtype dG_disl_kT_g = dG_disl_g / (kb * ICond->Temp);
-
-      // 3. 【统一合并】：物理意义为 exp([ΔG_surf + ΔG_disl] / kT)
-      realtype emission_ratio = (IMaterial->solPBar[pref] / solP[pref]) * exp(dG_surf_g + dG_disl_kT_g);
-
-      if (emission_ratio > data->max_emission_ratio_seen)
-        data->max_emission_ratio_seen = emission_ratio;
-      if (!std::isfinite(emission_ratio))
-        data->non_finite_count++;
-
-      realtype forward_flux = wpEff * C_right_g;
-      realtype backward_flux = wpEff * emission_ratio * C_left_g;
-
-      J_M[fluxIndex(p, g)] = forward_flux - backward_flux;
-      realtype abs_flux = abs(J_M[fluxIndex(p, g)]);
-      if (abs_flux > data->max_abs_flux_seen)
-        data->max_abs_flux_seen = abs_flux;
-      if (!std::isfinite(J_M[fluxIndex(p, g)]))
-        data->non_finite_count++;
-    }
-
-    J_M[fluxIndex(p, numGroups)] = ZERO;
-  }
-}
-
-static int f(realtype t, N_Vector y, N_Vector ydot, void *user_data)
-{
-  realtype *yd = NV_DATA_S(y);
-  realtype *ydotd = NV_DATA_S(ydot);
-  UserDataType *data = static_cast<UserDataType *>(user_data);
-
-  data->rhs_eval_counter++;
-  if (data->rhs_eval_counter % 500000 == 0)
-  {
-    realtype progress = ZERO;
-    if (data->current_target_t > ZERO)
-      progress = t / data->current_target_t;
-
-    long int nst_total = 0;
-    long int nli_total = 0;
-    if (data->cvode_mem != nullptr)
-    {
-      CVodeGetNumSteps(data->cvode_mem, &nst_total);
-      CVodeGetNumLinIters(data->cvode_mem, &nli_total);
-    }
-
-    logStream() << scientific << setprecision(6)
-                << "[diag-rhs] eval=" << data->rhs_eval_counter
-                << " t=" << t
-                << " minSolP=" << data->min_solP_seen
-                << " maxEmissionRatio=" << data->max_emission_ratio_seen
-                << " nonFinite=" << data->non_finite_count << endl;
-
-    logStream() << scientific << setprecision(6)
-                << "[diag-rhs-detail] run=" << data->current_run
-                << " target_t=" << data->current_target_t
-                << " progress=" << progress
-                << " totalSteps=" << nst_total
-                << " totalLinIters=" << nli_total << endl;
-  }
-
-  getGroupFlux(data, y, data->J_M);
-
-  realtype total_sol_cons[numComp] = {0.0, 0.0, 0.0};
-
-  for (int p = 0; p < numCalcPhase; p++)
-  {
-    int pref = p % numPhase;
-    int p_base = p * numGroups * 2; // 交错排列基底索引
-
-    ydotd[p_base] = -data->J_M[fluxIndex(p, 1)];     // M0_0
-    ydotd[p_base + 1] = -data->J_M[fluxIndex(p, 1)]; // M1_0
-
-    for (int g = 1; g < numGroups; g++)
-    {
-      ydotd[p_base + 2 * g] = data->J_M[fluxIndex(p, g)] - data->J_M[fluxIndex(p, g + 1)];
-      ydotd[p_base + 2 * g + 1] = ydotd[p_base + 2 * g] * GMap[g].n_center;
-
-      for (int c = 0; c < numComp; c++)
-      {
-        total_sol_cons[c] += IMaterial->X[pref][c] * ydotd[p_base + 2 * g + 1] * GMap[g].width;
-      }
-    }
-  }
-
-  // 在每个 run 的目标时刻附近导出一次分组数据并生成图像
-  // writeGroupPlotDataAndImages(data, t, ydotd);
-
-  // =========================================================================
-  // 【核心机制融合】：统一计算 MNS 相 (T3 和 T6) 的热力学驱动力与实际浓度积
-  // =========================================================================
-  realtype driving_force_MNS[numPhase - 1] = {0.0};
-  realtype solP_MNS[numPhase - 1] = {1.0, 1.0}; // 预存实际浓度积，避免重复使用 pow 计算
-  realtype total_df_MNS = 0.0;
-
-  for (int p_MNS = 0; p_MNS < numPhase - 1; p_MNS++)
-  {
-    for (int c = 0; c < numComp; c++)
-    {
-      solP_MNS[p_MNS] *= pow(yd[neq_groups - numComp + c], IMaterial->X[p_MNS][c]);
-    }
-    // 驱动力 = 实际溶度积 / 平衡溶度积。若小于 1 则说明未过饱和。
-    realtype df = solP_MNS[p_MNS] / IMaterial->solPBar[p_MNS];
-    driving_force_MNS[p_MNS] = (df > 1.0) ? (df - 1.0) : 0.0;
-    total_df_MNS += driving_force_MNS[p_MNS];
-  }
-
-  // =========================================================================
-  // 【回归原版设计的机制 1】：平行伴侣触发 (Cu 跨越 20 时，催化伴生一个 22 原子的 MNS)
-  // =========================================================================
-  int p_Cu = 2;
-  realtype CutoCRP = 20.0;
-  realtype MNS_to_Cu_ratio = 1.1;
-
-  int g_Cu_crit = cluNumTGroupIndex(CutoCRP);
-  realtype companion_mns_atoms = CutoCRP * MNS_to_Cu_ratio;
-  int g_MNS_seed = cluNumTGroupIndex(companion_mns_atoms);
-
-  // 获取 Cu 团簇跨越 20 的通量，用作“催化率”
-  realtype coupling_flux = data->J_M[fluxIndex(p_Cu, g_Cu_crit)];
-
-  if (coupling_flux > ZERO)
-  {
-    // 注意：绝对不要从 p_Cu 中减去 coupling_flux！
-    // Cu 团簇继续保留在 p_Cu 中作为 Core 演化。
-
-    if (total_df_MNS > ZERO)
-    {
-      for (int p_MNS = 0; p_MNS < numPhase - 1; p_MNS++)
-      {
-        realtype fraction = driving_force_MNS[p_MNS] / total_df_MNS;
-        if (fraction > 1e-6)
-        {
-          realtype phase_flux = coupling_flux * fraction;
-          int mns_base = p_MNS * numGroups * 2;
-
-          // 在 MNS 相中生成一个独立的“伴侣/外壳”团簇
-          ydotd[mns_base + 2 * g_MNS_seed] += phase_flux;
-          ydotd[mns_base + 2 * g_MNS_seed + 1] += phase_flux * companion_mns_atoms;
-
-          // 消耗基体的 Mn, Ni, Si 来形成这个伴侣
-          for (int c = 0; c < numComp; c++)
-          {
-            total_sol_cons[c] += phase_flux * companion_mns_atoms * IMaterial->X[p_MNS][c];
-          }
-        }
-      }
-    }
-    else
-    {
-      // Fallback: 驱动力不足时挂载给 T3
-      int p_fallback = 0;
-      int mns_base = p_fallback * numGroups * 2;
-
-      ydotd[mns_base + 2 * g_MNS_seed] += coupling_flux;
-      ydotd[mns_base + 2 * g_MNS_seed + 1] += coupling_flux * companion_mns_atoms;
-
-      for (int c = 0; c < numComp; c++)
-      {
-        total_sol_cons[c] += coupling_flux * companion_mns_atoms * IMaterial->X[p_fallback][c];
-      }
-    }
-  }
-
-  // =========================================================================
-  // 【机制 2】：MNS 相的级联直接形核 (复用相同的竞争比例)
-  // =========================================================================
-  if (total_df_MNS > ZERO)
-  {
-    for (int p_MNS = 0; p_MNS < numPhase - 1; p_MNS++)
-    {
-      realtype fraction = driving_force_MNS[p_MNS] / total_df_MNS;
-
-      if (fraction > 1e-6)
-      {
-        // 直接复用之前算好的 solP_MNS[p_MNS] 结合 fraction 计算最终分配的生成率
-        realtype GR_p = IProp->Alpha * Flux * IProp->ccs * solP_MNS[p_MNS] / IProp->RsolP * fraction;
-
-        int g_hg = cluNumTGroupIndex(IProp->HGSize);
-        int p_hg = p_MNS + numPhase; // 异质形核相索引 (T3对应3, T6对应4)
-        int hg_base = p_hg * numGroups * 2;
-
-        ydotd[hg_base + 2 * g_hg] += GR_p;
-        ydotd[hg_base + 2 * g_hg + 1] += IProp->HGSize * GR_p;
-
-        for (int c = 0; c < numComp; c++)
-        {
-          total_sol_cons[c] += IMaterial->X[p_MNS][c] * (IProp->HGSize * GR_p);
-        }
-      }
-    }
-  }
-
-  // =========================================================================
-  // 【机制 3】：纯 Cu 相的级联形核 (独立计算)
-  // =========================================================================
-  int HGPhase_Cu = 2;       // 纯 Cu 相的 pref 索引
-  int HGSize_Cu = 16;       // 文献中 n_Cu-het = 16 atoms
-  realtype Alpha_Cu = 0.03; // 文献中 alpha_Cu = 0.03
-
-  realtype solP_Cu = 1.0;
-  for (int c = 0; c < numComp; c++)
-  {
-    realtype safe_C = std::max(1e-30, yd[neq_groups - numComp + c]);
-    solP_Cu *= pow(safe_C, IMaterial->X[HGPhase_Cu][c]);
-  }
-
-  // 按照驱动力比例缩放生成率
-  realtype GR_Cu = Alpha_Cu * Flux * IProp->ccs * solP_Cu / IMaterial->solPBar[HGPhase_Cu];
-
-  int g_hg_Cu = cluNumTGroupIndex(HGSize_Cu);
-  int p_hg_Cu = HGPhase_Cu + numPhase;
-  int hg_base_Cu = p_hg_Cu * numGroups * 2;
-
-  ydotd[hg_base_Cu + 2 * g_hg_Cu] += GR_Cu;
-  ydotd[hg_base_Cu + 2 * g_hg_Cu + 1] += HGSize_Cu * GR_Cu;
-
-  for (int c = 0; c < numComp; c++)
-  {
-    total_sol_cons[c] += IMaterial->X[HGPhase_Cu][c] * (HGSize_Cu * GR_Cu);
-  }
-
-  for (int c = 0; c < numComp; c++)
-  {
-    ydotd[neq_groups - numComp + c] = -total_sol_cons[c];
-  }
-
-  return 0;
-}
-
-/* =========================================================================
- * 输出与格式化函数
- * ========================================================================= */
-static void getOutput(N_Vector y, realtype radM1[numCalcPhase],
-                      realtype radM2[numCalcPhase],
-                      realtype rhoC[numCalcPhase])
-{
-  realtype *yd = NV_DATA_S(y);
-
-  for (int p = 0; p < numCalcPhase; p++)
-  {
-    int pref = p % numPhase;
-    int p_base = p * numGroups * 2;
-
-    realtype total_M0 = 0.0;
-    realtype sum_Ri_M0 = 0.0;
-    realtype total_M1 = 0.0;
-
-    for (int g = 0; g < numGroups; g++)
-    {
-      realtype M0, M1;
-      if (std::floor(GMap[g].n_max) < CutoffSize)
-        continue;
-      else if (std::ceil(GMap[g].n_min) < CutoffSize)
-      {
-        // 交错获取 M0, M1
-        M0 = yd[p_base + 2 * g] * ((std::floor(GMap[g].n_min) - CutoffSize + 1.0));
-        M1 = yd[p_base + 2 * g + 1] * ((std::floor(GMap[g].n_min) - CutoffSize + 1.0));
-      }
-      else
-      {
-        M0 = yd[p_base + 2 * g] * GMap[g].width;
-        M1 = yd[p_base + 2 * g + 1] * GMap[g].width;
-      }
-
-      if (M0 < 1e-35)
-        continue;
-
-      realtype n_avg = M1 / M0;
-      realtype r_avg =
-          pow(3.0 * IMaterial->cVol[pref] * n_avg / (4.0 * pi), 1.0 / 3.0);
-
-      total_M0 += M0;
-      sum_Ri_M0 += r_avg * M0;
-      total_M1 += M1;
-    }
-
-    if (total_M0 > 1e-35)
-    {
-      radM1[p] = sum_Ri_M0 / total_M0;
-      realtype n_mean = total_M1 / total_M0;
-      radM2[p] =
-          pow((n_mean * IMaterial->cVol[pref]) / ((4.0 / 3.0) * pi), 1.0 / 3.0);
-      rhoC[p] = total_M0 / IMaterial->aVol;
-    }
-    else
-    {
-      radM1[p] = 0.0;
-      radM2[p] = 0.0;
-      rhoC[p] = 0.0;
-    }
-  }
-}
-
-static void printYVector(N_Vector y, int runIdx)
-{
-  realtype *yd = NV_DATA_S(y);
-
-  for (int p = 0; p < numCalcPhase; p++)
-  {
-    string dir = gOutputDir + "/Phase_" + to_string(p);
-    std::filesystem::path dirPath(dir);
-    if (!std::filesystem::exists(dirPath))
-    {
-      if (!std::filesystem::create_directories(dirPath))
-        return;
-    }
-    string profStr = dir + "/Run" + to_string(runIdx) + ".txt";
-    std::filesystem::path profilePath(profStr);
-
-    ofstream P_file(profilePath.string(), ios::out | ios::trunc);
-    if (!P_file.is_open())
-      return;
-    P_file << "n_min\tn_max\tn_avg\tradius(m)\tdensity(1/m3)" << endl;
-
-    int pref = p % numPhase;
-    int p_base = p * numGroups * 2;
-    for (int g = 0; g < numGroups; g++)
-    {
-      // 交错获取 M0, M1
-      realtype M0 = yd[p_base + 2 * g] * GMap[g].width;
-      realtype M1 = yd[p_base + 2 * g + 1] * GMap[g].width;
-
-      realtype n_avg = (M0 > 1e-35) ? (M1 / M0) : GMap[g].n_center;
-      realtype r_avg = pow(3.0 * IMaterial->cVol[pref] * n_avg / (4.0 * pi), 1.0 / 3.0);
-
-      P_file << GMap[g].n_min << "\t" << GMap[g].n_max << "\t" << n_avg << "\t"
-             << r_avg << "\t" << (M0 / GMap[g].width) / IMaterial->aVol << endl;
-    }
-    P_file.close();
-
-    // plotPhaseProfile(profilePath, p, runIdx);
-  }
-}
-
-void int_to_string(int i, string &a, int base)
-{
-  int ii = i;
-  string aa;
-  int remain = ii % base;
-  if (ii == 0)
-  {
-    a.push_back(ii + 48);
-    return;
-  }
-  while (ii > 0)
-  {
-    aa.push_back(ii % base + 48);
-    ii = (ii - remain) / base;
-    remain = ii % base;
-  }
-  for (int j = aa.size() - 1; j >= 0; j--)
-  {
-    a.push_back(aa[j]);
   }
 }

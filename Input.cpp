@@ -24,7 +24,7 @@ void LoadInput(InputCondition *ICond, InputMaterial *IMaterial, InputProperty *I
         IMaterial->C0[0] = 0.0116;                      // Mn composition in alloy
         IMaterial->C0[1] = 0.0163;                      // Ni composition in alloy
         IMaterial->C0[2] = 0.0035;                      // Si composition in alloy
-        IMaterial->C0[3] = 0.0000001;                      // Cu composition in alloy
+        IMaterial->C0[3] = 0.0020;                      // Cu composition in alloy
 
         IMaterial->D[0] = (1.49E-4) * exp(-234000.0 / (8.314 * ICond->Temp)); // Mn thermal diffusion coefficient, m2/s
         IMaterial->D[1] = (1.4E-4) * exp(-245765.0 / (8.314 * ICond->Temp));  // Ni thermal diffusion coefficient, m2/s
